@@ -1,0 +1,79 @@
+colony:
+  initial_population: 200
+  max_population: 500
+  spawn_rate: 0.1            # new ants per tick when food stored > 50
+  initial_food_stored: 100
+
+ant:
+  base_speed: 2.0
+  max_carry: 1.0
+  energy_max: 100
+  energy_cost_base: 0.02
+  energy_cost_speed: 0.01
+  energy_cost_carry: 0.03
+  energy_refill_rate: 2.0
+  antenna_angle: 30          # degrees, half-angle of each cone
+  antenna_range: 40          # pixels
+  neighbor_radius: 20
+  obstacle_ray_count: 5
+  obstacle_ray_range: 30
+  obstacle_ray_arc: 120      # degrees
+
+pheromone:
+  cell_size: 4
+  channels:
+    food:
+      decay: 0.995
+      diffusion_sigma: 0.5
+      color: [0, 255, 0]     # green overlay
+    home:
+      decay: 0.997
+      diffusion_sigma: 0.5
+      color: [0, 100, 255]   # blue overlay
+    danger:
+      decay: 0.980
+      diffusion_sigma: 0.8
+      color: [255, 0, 0]     # red overlay
+    recruit:
+      decay: 0.985
+      diffusion_sigma: 1.2
+      color: [255, 200, 0]   # yellow overlay
+
+roles:
+  default_distribution:
+    forager: 0.60
+    nurse: 0.15
+    soldier: 0.10
+    idle: 0.15
+  rebalance_interval: 500    # ticks
+
+brain:
+  default: rule_based        # rule_based | nn | transformer
+  patches:
+    survival_homing: true
+    auto_pickup: true
+    food_drop_guard: true
+  nn:
+    hidden_sizes: [64, 32]
+    learning_rate: 0.0001
+    gamma: 0.95
+    buffer_size: 200
+    update_interval: 100
+  transformer:
+    context_length: 16
+    d_model: 32
+    n_heads: 4
+    n_layers: 2
+    ffn_dim: 64
+    learning_rate: 0.00005
+    buffer_size: 500
+    update_interval: 200
+
+world:
+  width: 1600
+  height: 1000
+  num_food_sources: 5
+  food_source_size_range: [20, 50]   # radius
+  food_source_amount_range: [50, 500]
+  food_respawn_interval: 3000        # ticks
+  num_obstacles: 10

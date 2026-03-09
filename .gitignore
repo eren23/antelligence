@@ -1,0 +1,13 @@
+saves/*.pkl
+weights/
+!weights/.gitkeep
+*.mp4
+.agent/
+.attocode/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
