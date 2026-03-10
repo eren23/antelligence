@@ -167,6 +167,44 @@ def main() -> None:
     metrics = MetricsTracker(window=0)
     emergence = EmergenceDetector(cfg.roles.default_distribution)
 
+    def _ppo_state_from_brain(ant_brain: Any) -> np.ndarray | None:
+        """Extract PPO state in model-ready shape.
+
+        - torch_nn / nn: returns flat sensory vector (39,)
+        - torch_transformer: returns fixed-shape context (context_len, 39), zero-padded on the left
+        """
+        prev_vec = getattr(ant_brain, "_prev_vec", None)
+        if prev_vec is not None:
+            return np.asarray(prev_vec, dtype=np.float32)
+
+        prev_ctx_flat = getattr(ant_brain, "_prev_context_flat", None)
+        if prev_ctx_flat is None:
+            return None
+
+        # Transformer context path.
+        if args.brain == "torch_transformer":
+            flat = np.asarray(prev_ctx_flat, dtype=np.float32).reshape(-1)
+            if flat.size % 39 != 0:
+                return None
+
+            seq_len = int(getattr(ant_brain, "_prev_seq_len", 0))
+            if seq_len <= 0:
+                seq_len = flat.size // 39
+            seq_len = min(seq_len, flat.size // 39)
+            if seq_len <= 0:
+                return None
+
+            ctx = flat[: seq_len * 39].reshape(seq_len, 39)
+            target_len = int(cfg.brain.transformer.context_length)
+            if target_len > seq_len:
+                pad = np.zeros((target_len - seq_len, 39), dtype=np.float32)
+                ctx = np.concatenate([pad, ctx], axis=0)
+            elif target_len < seq_len:
+                ctx = ctx[-target_len:]
+            return ctx.astype(np.float32, copy=False)
+
+        return np.asarray(prev_ctx_flat, dtype=np.float32)
+
     # Training loop with PPO
     t_start = time.perf_counter()
     best_food = 0.0
@@ -195,9 +233,7 @@ def main() -> None:
             role = ant.role.value
             if role in ppo_trainers:
                 trainer = ppo_trainers[role]
-                prev_vec = getattr(ant.brain, "_prev_vec", None)
-                if prev_vec is None:
-                    prev_vec = getattr(ant.brain, "_prev_context_flat", None)
+                prev_vec = _ppo_state_from_brain(ant.brain)
                 if prev_vec is not None:
                     prev_lp = getattr(ant.brain, "_prev_log_prob", 0.0)
 
@@ -213,8 +249,31 @@ def main() -> None:
                             _model = ppo_trainers[role].model
                             _dev = next(_model.parameters()).device
                             _x = _torch.tensor(prev_vec, dtype=_torch.float32, device=_dev)
-                            if _x.dim() == 1:
-                                _x = _x.unsqueeze(0)
+                            if args.brain == "torch_transformer":
+                                # Transformer expects (B, seq, input_dim=39). We store flattened context.
+                                if _x.dim() == 1:
+                                    if (_x.numel() % 39) != 0:
+                                        raise RuntimeError(
+                                            f"torch_transformer prev_vec has invalid size {_x.numel()} (not divisible by 39)",
+                                        )
+                                    _x = _x.view(1, -1, 39)
+                                elif _x.dim() == 2:
+                                    # Could be (seq, 39) or (B, flat_context)
+                                    if _x.shape[-1] == 39:
+                                        _x = _x.unsqueeze(0)
+                                    elif (_x.shape[-1] % 39) == 0:
+                                        _x = _x.view(_x.shape[0], -1, 39)
+                                    else:
+                                        raise RuntimeError(
+                                            f"torch_transformer prev_vec has invalid shape {tuple(_x.shape)}",
+                                        )
+                                else:
+                                    raise RuntimeError(
+                                        f"torch_transformer prev_vec has unsupported rank {_x.dim()}",
+                                    )
+                            else:
+                                if _x.dim() == 1:
+                                    _x = _x.unsqueeze(0)
                             _, _val = _model(_x)
                             value = float(_val.item())
                     else:
@@ -272,9 +331,7 @@ def main() -> None:
                 # Death penalty to PPO buffer
                 role = ant.role.value
                 if role in ppo_trainers:
-                    prev_vec = getattr(ant.brain, "_prev_vec", None)
-                    if prev_vec is None:
-                        prev_vec = getattr(ant.brain, "_prev_context_flat", None)
+                    prev_vec = _ppo_state_from_brain(ant.brain)
                     if prev_vec is not None:
                         ppo_trainers[role].buffer.add(PPOStep(
                             state=prev_vec,
