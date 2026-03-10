@@ -1,7 +1,8 @@
-"""Compare all three brain backends across multiple seeds.
+"""Compare selected brain backends across multiple seeds.
 
 Usage:
-    python compare_brains.py                        # defaults: 3 seeds, 5000 ticks
+    python compare_brains.py                        # defaults: 4 brains, 3 seeds, 5000 ticks
+    python compare_brains.py --brains nn torch_nn transformer torch_transformer
     python compare_brains.py --ticks 10000 --seeds 1 2 3 4 5
     python compare_brains.py --ants 100 --out results.json
 """
@@ -10,17 +11,24 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
 from main import run_headless
 
-BRAINS = ["rule_based", "nn", "transformer"]
+DEFAULT_BRAINS = ["nn", "torch_nn", "transformer", "torch_transformer"]
+VALID_BRAINS = ["rule_based", "nn", "transformer", "torch_nn", "torch_transformer"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare brain backends")
+    p.add_argument(
+        "--brains",
+        nargs="+",
+        default=DEFAULT_BRAINS,
+        choices=VALID_BRAINS,
+        help=f"Brains to compare (default: {' '.join(DEFAULT_BRAINS)})",
+    )
     p.add_argument("--ticks", "-t", type=int, default=5000,
                    help="Ticks per simulation (default: 5000)")
     p.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 7],
@@ -42,6 +50,7 @@ def _avg(values: list[float]) -> float:
 
 def run_comparison(
     *,
+    brains: list[str],
     ticks: int,
     seeds: list[int],
     ants: int | None,
@@ -49,11 +58,11 @@ def run_comparison(
     verbose: bool,
 ) -> dict[str, Any]:
     """Run all brains across all seeds. Returns full results dict."""
-    all_results: dict[str, list[dict[str, Any]]] = {b: [] for b in BRAINS}
-    total_runs = len(BRAINS) * len(seeds)
+    all_results: dict[str, list[dict[str, Any]]] = {b: [] for b in brains}
+    total_runs = len(brains) * len(seeds)
     run_num = 0
 
-    for brain in BRAINS:
+    for brain in brains:
         for seed in seeds:
             run_num += 1
             print(f"\n{'='*60}")
@@ -91,7 +100,7 @@ def _trail_formation_speed(report: dict[str, Any]) -> float:
     return float("inf")
 
 
-def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
+def print_comparison_table(results: dict[str, list[dict[str, Any]]], brains: list[str]) -> None:
     """Print a formatted comparison table to stdout."""
     print(f"\n{'='*80}")
     print("BRAIN COMPARISON RESULTS")
@@ -99,7 +108,7 @@ def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
 
     # Column headers
     header = f"{'Metric':<30}"
-    for brain in BRAINS:
+    for brain in brains:
         header += f"  {brain:>14}"
     print(header)
     print("-" * len(header))
@@ -116,7 +125,7 @@ def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
         ("Cemetery clusters", "cemetery_cluster_count", ".1f"),
     ]:
         vals = []
-        for brain in BRAINS:
+        for brain in brains:
             reports = results[brain]
             mean = _avg([r[key] for r in reports])
             vals.append(f"{mean:{fmt}}")
@@ -124,7 +133,7 @@ def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
 
     # Trail formation speed (derived metric)
     trail_vals = []
-    for brain in BRAINS:
+    for brain in brains:
         reports = results[brain]
         speeds = [_trail_formation_speed(r) for r in reports]
         finite = [s for s in speeds if s != float("inf")]
@@ -136,7 +145,7 @@ def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
 
     # Foraging efficiency from emergence
     eff_vals = []
-    for brain in BRAINS:
+    for brain in brains:
         reports = results[brain]
         mean = _avg([r["emergence"]["foraging_efficiency"] for r in reports])
         eff_vals.append(f"{mean:.3f}")
@@ -144,7 +153,7 @@ def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
 
     # Avg reward (brain_specific)
     reward_vals = []
-    for brain in BRAINS:
+    for brain in brains:
         reports = results[brain]
         mean = _avg([
             r["brain_specific"].get("avg_reward", 0.0) for r in reports
@@ -154,7 +163,7 @@ def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
 
     # Wall time
     time_vals = []
-    for brain in BRAINS:
+    for brain in brains:
         reports = results[brain]
         mean = _avg([r["performance"]["wall_time_seconds"] for r in reports])
         time_vals.append(f"{mean:.1f}s")
@@ -172,8 +181,10 @@ def print_comparison_table(results: dict[str, list[dict[str, Any]]]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    brains = args.brains
 
     results = run_comparison(
+        brains=brains,
         ticks=args.ticks,
         seeds=args.seeds,
         ants=args.ants,
@@ -181,7 +192,7 @@ def main(argv: list[str] | None = None) -> None:
         verbose=not args.quiet,
     )
 
-    print_comparison_table(results)
+    print_comparison_table(results, brains)
 
     if args.out:
         out_path = Path(args.out)

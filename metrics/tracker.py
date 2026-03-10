@@ -140,6 +140,26 @@ class MetricsTracker:
     def ticks(self) -> list[int]:
         return [s.tick for s in self._snapshots]
 
+    def aggregate_window(self, n: int = 1000) -> np.ndarray:
+        """Aggregate last *n* snapshots into a 5-dim feature vector.
+
+        Returns:
+            [total_food, avg_reward, avg_population, total_deaths, avg_pheromone_mass]
+        """
+        snaps = list(self._snapshots)[-n:] if self._snapshots else []
+        if not snaps:
+            return np.zeros(5, dtype=np.float64)
+
+        total_food = sum(s.food_income for s in snaps)
+        avg_reward = sum(s.avg_reward for s in snaps) / len(snaps)
+        avg_pop = sum(s.population for s in snaps) / len(snaps)
+        total_deaths = sum(s.deaths for s in snaps)
+        avg_phero = sum(s.pheromone_mass for s in snaps) / len(snaps)
+
+        return np.array([
+            total_food, avg_reward, avg_pop, total_deaths, avg_phero,
+        ], dtype=np.float64)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

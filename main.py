@@ -49,12 +49,14 @@ from agents.ant import (
 )
 from agents.colony import Colony, Corpse
 from agents.sensory import build_sensory
+from world.spatial import SpatialGrid
 from brains.nn_brain import (
     NNBrain,
     SharedWeightRegistry as NNWeightRegistry,
     RoleTrainer as NNRoleTrainer,
     compute_reward,
 )
+from brains.reward import SparseReward
 from brains.rule_based import RuleBasedBrain
 from brains.transformer_brain import (
     TransformerBrain,
@@ -62,21 +64,21 @@ from brains.transformer_brain import (
     RoleTrainer as TFRoleTrainer,
 )
 
-# MLX backends (optional)
+# PyTorch backends (optional)
 try:
-    from brains.mlx_nn_brain import (
-        MLXNNBrain,
-        SharedWeightRegistry as MLXNNWeightRegistry,
-        RoleTrainer as MLXNNRoleTrainer,
+    from brains.torch_nn_brain import (
+        TorchNNBrain,
+        TorchSharedWeightRegistry as TorchNNWeightRegistry,
+        TorchRoleTrainer as TorchNNRoleTrainer,
     )
-    from brains.mlx_transformer_brain import (
-        MLXTransformerBrain,
-        SharedWeightRegistry as MLXTFWeightRegistry,
-        RoleTrainer as MLXTFRoleTrainer,
+    from brains.torch_transformer_brain import (
+        TorchTransformerBrain,
+        TorchTransformerSharedWeightRegistry as TorchTFWeightRegistry,
+        TorchTransformerRoleTrainer as TorchTFRoleTrainer,
     )
-    _MLX_AVAILABLE = True
+    _TORCH_AVAILABLE = True
 except ImportError:
-    _MLX_AVAILABLE = False
+    _TORCH_AVAILABLE = False
 from config import SimConfig, default_config, load_config
 from metrics.emergence import EmergenceDetector
 from metrics.reporter import write_report
@@ -126,55 +128,6 @@ def _load_trainer_state(path: Path, trainer: object) -> None:
         trainer.global_step = state["global_step"]
 
 
-def _flatten_mlx_params(params: Any, prefix: str = "") -> dict[str, np.ndarray]:
-    """Flatten nested MLX parameter dict to {dotted_key: numpy_array}."""
-    import mlx.core as mx
-    flat: dict[str, np.ndarray] = {}
-    if isinstance(params, dict):
-        for k, v in params.items():
-            flat.update(_flatten_mlx_params(v, f"{prefix}{k}."))
-    elif isinstance(params, list):
-        for i, v in enumerate(params):
-            flat.update(_flatten_mlx_params(v, f"{prefix}{i}."))
-    else:
-        # params is an mx.array leaf
-        flat[prefix.rstrip(".")] = np.array(params)
-    return flat
-
-
-def _unflatten_mlx_params(model: Any, data: Any) -> None:
-    """Load flattened numpy arrays back into an MLX model."""
-    import mlx.core as mx
-
-    # Rebuild the nested dict structure from dotted keys
-    nested: dict = {}
-    for key in data.files:
-        parts = key.split(".")
-        d = nested
-        for p in parts[:-1]:
-            if p not in d:
-                d[p] = {}
-            d = d[p]
-        d[parts[-1]] = mx.array(data[key])
-
-    # Convert numeric string keys to list indices where needed
-    def _to_tree(d: dict) -> Any:
-        if not isinstance(d, dict):
-            return d
-        if all(k.isdigit() for k in d):
-            max_idx = max(int(k) for k in d)
-            lst = [None] * (max_idx + 1)
-            for k, v in d.items():
-                lst[int(k)] = _to_tree(v)
-            return lst
-        return {k: _to_tree(v) for k, v in d.items()}
-
-    tree = _to_tree(nested)
-    model.update(tree)
-    # Force MLX lazy evaluation to materialize loaded weights
-    mx.eval(model.parameters())  # noqa: S307 — mlx.core.eval, not builtins.eval
-
-
 # ---------------------------------------------------------------------------
 # Brain factory — creates and manages brain instances per backend type
 # ---------------------------------------------------------------------------
@@ -197,10 +150,10 @@ class BrainManager:
         self._nn_trainers: dict[str, NNRoleTrainer] = {}
         self._tf_registry: TFWeightRegistry | None = None
         self._tf_trainers: dict[str, TFRoleTrainer] = {}
-        self._mlx_nn_registry = None
-        self._mlx_nn_trainers: dict = {}
-        self._mlx_tf_registry = None
-        self._mlx_tf_trainers: dict = {}
+        self._torch_nn_registry = None
+        self._torch_nn_trainers: dict = {}
+        self._torch_tf_registry = None
+        self._torch_tf_trainers: dict = {}
 
     @property
     def current_type(self) -> str:
@@ -239,27 +192,27 @@ class BrainManager:
                 if trainer:
                     _save_trainer_state(path / f"trainer_transformer_{role}.json", trainer)
 
-        # MLX NN
-        if self._mlx_nn_registry is not None and _MLX_AVAILABLE:
-            import mlx.core as mx
-            for role in self._mlx_nn_registry.roles():
-                model = self._mlx_nn_registry.get(role)
-                flat = _flatten_mlx_params(model.parameters())
-                np.savez(path / f"mlx_nn_{role}.npz", **flat)
-                trainer = self._mlx_nn_trainers.get(role)
+        # PyTorch NN
+        if self._torch_nn_registry is not None and _TORCH_AVAILABLE:
+            import torch as _torch
+            for role in self._torch_nn_registry.roles():
+                model = self._torch_nn_registry.get(role)
+                sd = {k: v.cpu().numpy() for k, v in model.state_dict().items()}
+                np.savez(path / f"torch_nn_{role}.npz", **sd)
+                trainer = self._torch_nn_trainers.get(role)
                 if trainer:
-                    _save_trainer_state(path / f"trainer_mlx_nn_{role}.json", trainer)
+                    _save_trainer_state(path / f"trainer_torch_nn_{role}.json", trainer)
 
-        # MLX Transformer
-        if self._mlx_tf_registry is not None and _MLX_AVAILABLE:
-            import mlx.core as mx
-            for role in self._mlx_tf_registry.roles():
-                model = self._mlx_tf_registry.get(role)
-                flat = _flatten_mlx_params(model.parameters())
-                np.savez(path / f"mlx_transformer_{role}.npz", **flat)
-                trainer = self._mlx_tf_trainers.get(role)
+        # PyTorch Transformer
+        if self._torch_tf_registry is not None and _TORCH_AVAILABLE:
+            import torch as _torch
+            for role in self._torch_tf_registry.roles():
+                model = self._torch_tf_registry.get(role)
+                sd = {k: v.cpu().numpy() for k, v in model.state_dict().items()}
+                np.savez(path / f"torch_transformer_{role}.npz", **sd)
+                trainer = self._torch_tf_trainers.get(role)
                 if trainer:
-                    _save_trainer_state(path / f"trainer_mlx_transformer_{role}.json", trainer)
+                    _save_trainer_state(path / f"trainer_torch_transformer_{role}.json", trainer)
 
     def load_weights(self, path: Path) -> None:
         """Load weights from directory into registries."""
@@ -301,30 +254,36 @@ class BrainManager:
                 _load_trainer_state(path / f"trainer_transformer_{role}.json", trainer)
             loaded_any = True
 
-        # MLX NN
-        if _MLX_AVAILABLE:
-            for npz in sorted(path.glob("mlx_nn_*.npz")):
-                role = npz.stem.removeprefix("mlx_nn_")
-                self._ensure_mlx_nn()
-                model = self._mlx_nn_registry.get(role)
+        # PyTorch NN
+        if _TORCH_AVAILABLE:
+            import torch as _torch
+            for npz in sorted(path.glob("torch_nn_*.npz")):
+                role = npz.stem.removeprefix("torch_nn_")
+                self._ensure_torch_nn()
+                model = self._torch_nn_registry.get(role)
                 d = np.load(npz)
-                _unflatten_mlx_params(model, d)
-                trainer = self._mlx_nn_trainers.get(role)
+                sd = {k: _torch.tensor(d[k]) for k in d.files}
+                model.load_state_dict(sd)
+                model.to(self._torch_nn_registry._device)
+                trainer = self._torch_nn_trainers.get(role)
                 if trainer:
-                    _load_trainer_state(path / f"trainer_mlx_nn_{role}.json", trainer)
+                    _load_trainer_state(path / f"trainer_torch_nn_{role}.json", trainer)
                 loaded_any = True
 
-        # MLX Transformer
-        if _MLX_AVAILABLE:
-            for npz in sorted(path.glob("mlx_transformer_*.npz")):
-                role = npz.stem.removeprefix("mlx_transformer_")
-                self._ensure_mlx_tf()
-                model = self._mlx_tf_registry.get(role)
+        # PyTorch Transformer
+        if _TORCH_AVAILABLE:
+            import torch as _torch
+            for npz in sorted(path.glob("torch_transformer_*.npz")):
+                role = npz.stem.removeprefix("torch_transformer_")
+                self._ensure_torch_tf()
+                model = self._torch_tf_registry.get(role)
                 d = np.load(npz)
-                _unflatten_mlx_params(model, d)
-                trainer = self._mlx_tf_trainers.get(role)
+                sd = {k: _torch.tensor(d[k]) for k in d.files}
+                model.load_state_dict(sd)
+                model.to(self._torch_tf_registry._device)
+                trainer = self._torch_tf_trainers.get(role)
                 if trainer:
-                    _load_trainer_state(path / f"trainer_mlx_transformer_{role}.json", trainer)
+                    _load_trainer_state(path / f"trainer_torch_transformer_{role}.json", trainer)
                 loaded_any = True
 
         if loaded_any:
@@ -369,33 +328,33 @@ class BrainManager:
                 buffer_size=tf.buffer_size,
             )
 
-    def _ensure_mlx_nn(self) -> None:
-        if self._mlx_nn_registry is not None or not _MLX_AVAILABLE:
+    def _ensure_torch_nn(self) -> None:
+        if self._torch_nn_registry is not None or not _TORCH_AVAILABLE:
             return
         nn_cfg = self.cfg.brain.nn
-        self._mlx_nn_registry = MLXNNWeightRegistry(
+        self._torch_nn_registry = TorchNNWeightRegistry(
             input_dim=39, hidden_sizes=nn_cfg.hidden_sizes, seed=self.seed,
         )
-        for role in self._mlx_nn_registry.roles():
-            self._mlx_nn_trainers[role] = MLXNNRoleTrainer(
-                self._mlx_nn_registry.get(role),
+        for role in self._torch_nn_registry.roles():
+            self._torch_nn_trainers[role] = TorchNNRoleTrainer(
+                self._torch_nn_registry.get(role),
                 lr=nn_cfg.learning_rate, gamma=nn_cfg.gamma,
                 buffer_size=nn_cfg.buffer_size,
             )
 
-    def _ensure_mlx_tf(self) -> None:
-        if self._mlx_tf_registry is not None or not _MLX_AVAILABLE:
+    def _ensure_torch_tf(self) -> None:
+        if self._torch_tf_registry is not None or not _TORCH_AVAILABLE:
             return
         tf_cfg = self.cfg.brain.transformer
-        self._mlx_tf_registry = MLXTFWeightRegistry(
+        self._torch_tf_registry = TorchTFWeightRegistry(
             input_dim=39,
             d_model=tf_cfg.d_model, n_heads=tf_cfg.n_heads,
             n_layers=tf_cfg.n_layers, ffn_dim=tf_cfg.ffn_dim,
             seed=self.seed,
         )
-        for role in self._mlx_tf_registry.roles():
-            self._mlx_tf_trainers[role] = MLXTFRoleTrainer(
-                self._mlx_tf_registry.get(role),
+        for role in self._torch_tf_registry.roles():
+            self._torch_tf_trainers[role] = TorchTFRoleTrainer(
+                self._torch_tf_registry.get(role),
                 lr=tf_cfg.learning_rate, gamma=0.95,
                 buffer_size=tf_cfg.buffer_size,
                 context_length=tf_cfg.context_length,
@@ -433,21 +392,21 @@ class BrainManager:
                 cfg=self.cfg.brain.transformer,
                 seed=ant_seed,
             )
-        elif bt == "mlx_nn" and _MLX_AVAILABLE:
-            self._ensure_mlx_nn()
-            ant.brain = MLXNNBrain(
+        elif bt == "torch_nn" and _TORCH_AVAILABLE:
+            self._ensure_torch_nn()
+            ant.brain = TorchNNBrain(
                 role=role,
-                registry=self._mlx_nn_registry,
-                trainer=self._mlx_nn_trainers[role],
+                registry=self._torch_nn_registry,
+                trainer=self._torch_nn_trainers[role],
                 cfg=self.cfg.brain.nn,
                 seed=ant_seed,
             )
-        elif bt == "mlx_transformer" and _MLX_AVAILABLE:
-            self._ensure_mlx_tf()
-            ant.brain = MLXTransformerBrain(
+        elif bt == "torch_transformer" and _TORCH_AVAILABLE:
+            self._ensure_torch_tf()
+            ant.brain = TorchTransformerBrain(
                 role=role,
-                registry=self._mlx_tf_registry,
-                trainer=self._mlx_tf_trainers[role],
+                registry=self._torch_tf_registry,
+                trainer=self._torch_tf_trainers[role],
                 cfg=self.cfg.brain.transformer,
                 seed=ant_seed,
             )
@@ -681,13 +640,19 @@ def sim_tick(
     """Execute one simulation tick (the full per-tick pipeline)."""
     ants = colony.ants
 
+    # Build spatial grid for O(n) neighbor lookups
+    spatial_grid = SpatialGrid(cfg.world.width, cfg.world.height, cell_size=40)
+    spatial_grid.rebuild(ants)
+
     # 1. Build sensory inputs for all alive ants
     for ant in ants:
         if ant.alive:
-            ant.sensory = build_sensory(ant, world, pheromone_grid, ants, cfg.ant)
+            ant.sensory = build_sensory(ant, world, pheromone_grid, ants, cfg.ant,
+                                        spatial_grid=spatial_grid)
 
     # 2. Reward & learn from the *previous* tick's transition
     #    (must happen before decide() overwrites brain internals)
+    sparse_reward = SparseReward()
     if learn:
         for ant in ants:
             if not ant.alive or ant.brain is None or ant.sensory is None:
@@ -696,7 +661,11 @@ def sim_tick(
             if prev_act is None:
                 continue
             prev_si = getattr(ant.brain, "_prev_sensory", None)
-            reward = compute_reward(prev_si, ant.sensory, prev_act, True)
+            is_learning_brain = not isinstance(ant.brain, RuleBasedBrain)
+            if is_learning_brain:
+                reward = sparse_reward.compute(prev_si, ant.sensory, prev_act, True)
+            else:
+                reward = compute_reward(prev_si, ant.sensory, prev_act, True)
             ant.brain.learn(reward)
             metrics.accumulate_reward(reward)
 
@@ -715,7 +684,11 @@ def sim_tick(
         action = actions[ant.id]
 
         # Survival instinct: when energy is critically low, head toward nest
-        if cfg.brain.patches.survival_homing and ant.energy < cfg.ant.energy_max * 0.3:
+        # Gated: skip for learning brains unless learning_brain_patches is True
+        is_learning_brain = not isinstance(ant.brain, RuleBasedBrain)
+        if (cfg.brain.patches.survival_homing
+                and ant.energy < cfg.ant.energy_max * 0.3
+                and (cfg.brain.patches.learning_brain_patches or not is_learning_brain)):
             to_nest = world.nest.center - ant.pos
             nest_angle = math.atan2(to_nest.y, to_nest.x)
             turn_to_nest = nest_angle - ant.heading
@@ -743,8 +716,9 @@ def sim_tick(
             # Immediate death penalty so learning gets the signal
             # (the ant will be removed from colony.ants by colony.tick)
             if learn and ant.brain is not None:
-                ant.brain.learn(-0.5)
-                metrics.accumulate_reward(-0.5)
+                death_penalty = -1.0 if is_learning_brain else -0.5
+                ant.brain.learn(death_penalty)
+                metrics.accumulate_reward(death_penalty)
             continue
 
         # Nest: refill energy & auto-deposit food
@@ -754,8 +728,11 @@ def sim_tick(
             colony.deposit_food(carry_before)
 
         # Item interactions — auto-pickup if enabled, otherwise respect brain decision
+        # Gated: skip auto-pickup for learning brains unless learning_brain_patches is True
         was_carrying = ant.carrying
-        if action.pickup or (cfg.brain.patches.auto_pickup and ant.carrying is None):
+        if action.pickup or (cfg.brain.patches.auto_pickup
+                and (cfg.brain.patches.learning_brain_patches or not is_learning_brain)
+                and ant.carrying is None):
             try_pickup(ant, world, cfg.ant)
             # Nurses also try to pick up nearby corpses
             if ant.carrying is None and ant.role == Role.NURSE:
@@ -934,7 +911,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Run without opening a window")
     p.add_argument("--ticks", "-t", type=int, default=0,
                    help="Max ticks (0 = unlimited)")
-    p.add_argument("--brain", choices=["rule_based", "nn", "transformer", "mlx_nn", "mlx_transformer"],
+    p.add_argument("--brain", choices=["rule_based", "nn", "transformer", "torch_nn", "torch_transformer"],
                    default=None, help="Override initial brain backend")
     p.add_argument("--ants", type=int, default=None,
                    help="Override initial ant population count")

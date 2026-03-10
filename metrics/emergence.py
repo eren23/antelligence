@@ -47,6 +47,18 @@ class EmergenceReport:
             "role_rebalancing": self.role_rebalancing,
         }
 
+    def as_vector(self) -> np.ndarray:
+        """Return emergence scores as a 7-dim numpy vector for judge input."""
+        return np.array([
+            self.trail_formation,
+            self.cemetery_clustering,
+            self.brood_sorting,
+            self.foraging_efficiency,
+            self.adaptive_rerouting,
+            self.recruitment_cascade,
+            self.role_rebalancing,
+        ], dtype=np.float64)
+
 
 # ---------------------------------------------------------------------------
 # Detector implementations

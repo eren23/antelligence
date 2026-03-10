@@ -29,7 +29,7 @@ from world.world import World
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Overnight headless training")
-    p.add_argument("--brain", choices=["nn", "transformer", "mlx_nn", "mlx_transformer"],
+    p.add_argument("--brain", choices=["nn", "transformer", "torch_nn", "torch_transformer"],
                    default="nn", help="Brain backend to train (default: nn)")
     p.add_argument("--ticks", "-t", type=int, default=100_000,
                    help="Total training ticks (default: 100000)")

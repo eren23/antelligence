@@ -31,6 +31,7 @@ from brains.nn_brain import (
     sample_action,
     log_prob_of_action,
 )
+from brains.reward import SparseReward
 from brains.ppo import PPORoleTrainer, PPOStep, PPOTransformerRoleTrainer
 from brains.transformer_brain import (
     TransformerBrain,
@@ -42,7 +43,7 @@ from config import SimConfig, load_config, default_config, PPOConfig
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PPO fine-tuning after imitation learning")
-    p.add_argument("--brain", choices=["nn", "transformer"], default="nn")
+    p.add_argument("--brain", choices=["nn", "transformer", "torch_nn", "torch_transformer"], default="nn")
     p.add_argument("--load-imitation", type=str, default="weights/imitation",
                     help="Load imitation-trained weights from DIR")
     p.add_argument("--ticks", type=int, default=50000,
@@ -67,47 +68,8 @@ def compute_reward_ppo(
     action: AntAction,
     alive: bool,
 ) -> float:
-    """PPO-specific reward function with adjusted signals.
-
-    Changes from REINFORCE reward:
-    - Food deposit: +1.0 -> +5.0 (terminal goal dominates)
-    - Remove energy micromanagement
-    - Add small time penalty: -0.01/tick
-    - Keep food approach (+0.2) and nest approach (+0.2)
-    - Keep pickup +0.3, death -0.5
-    """
-    reward = -0.01  # time penalty
-
-    if not alive:
-        return -0.5
-
-    if prev_sensory is not None:
-        # Food deposited: was carrying food, now not
-        if prev_sensory.carrying == "food" and curr_sensory.carrying is None:
-            reward += 5.0
-
-        # Picked up food
-        if prev_sensory.carrying is None and curr_sensory.carrying == "food":
-            reward += 0.3
-
-        # Approaching food
-        if curr_sensory.carrying is None and curr_sensory.nearest_food_distance < 1.0:
-            food_dist_delta = prev_sensory.nearest_food_distance - curr_sensory.nearest_food_distance
-            if food_dist_delta > 0.001:
-                reward += 0.2
-            elif food_dist_delta < -0.001:
-                reward -= 0.05
-
-        # Approaching nest with food
-        if curr_sensory.carrying == "food":
-            nest_dist_prev = prev_sensory.nest_distance
-            nest_dist_curr = curr_sensory.nest_distance
-            if nest_dist_curr < nest_dist_prev - 0.5:
-                reward += 0.2
-            elif nest_dist_curr > nest_dist_prev + 0.5:
-                reward -= 0.05
-
-    return reward
+    """PPO reward — delegates to SparseReward for genuine learning."""
+    return SparseReward().compute(prev_sensory, curr_sensory, action, alive)
 
 
 def main() -> None:
@@ -175,6 +137,24 @@ def main() -> None:
                 gae_lambda=cfg.brain.ppo.gae_lambda,
                 rollout_length=args.rollout_length,
             )
+    elif args.brain.startswith("torch_"):
+        from brains.torch_ppo import TorchPPOTrainer
+        if args.brain == "torch_nn":
+            brain_mgr._ensure_torch_nn()
+            for role in brain_mgr._torch_nn_registry.roles():
+                model = brain_mgr._torch_nn_registry.get(role)
+                ppo_trainers[role] = TorchPPOTrainer.from_config(
+                    model, cfg.brain.ppo, lr=args.lr,
+                    rollout_length=args.rollout_length,
+                )
+        elif args.brain == "torch_transformer":
+            brain_mgr._ensure_torch_tf()
+            for role in brain_mgr._torch_tf_registry.roles():
+                model = brain_mgr._torch_tf_registry.get(role)
+                ppo_trainers[role] = TorchPPOTrainer.from_config(
+                    model, cfg.brain.ppo, lr=args.lr,
+                    rollout_length=args.rollout_length,
+                )
 
     # Initialize simulation
     world = World.from_config(cfg, seed=args.seed)
@@ -227,6 +207,16 @@ def main() -> None:
                             brain_mgr._nn_registry.get(role), prev_vec
                         )
                         value = float(value) if not isinstance(value, float) else value
+                    elif args.brain.startswith("torch_"):
+                        import torch as _torch
+                        with _torch.no_grad():
+                            _model = ppo_trainers[role].model
+                            _dev = next(_model.parameters()).device
+                            _x = _torch.tensor(prev_vec, dtype=_torch.float32, device=_dev)
+                            if _x.dim() == 1:
+                                _x = _x.unsqueeze(0)
+                            _, _val = _model(_x)
+                            value = float(_val.item())
                     else:
                         value = 0.0  # transformer doesn't have analytical value yet
 
@@ -268,21 +258,8 @@ def main() -> None:
                 continue
             action = actions[ant.id]
 
-            # Survival homing (still active during PPO training)
-            if ant.energy < cfg.ant.energy_max * 0.3:
-                to_nest = world.nest.center - ant.pos
-                nest_angle = math.atan2(to_nest.y, to_nest.x)
-                turn_to_nest = nest_angle - ant.heading
-                turn_to_nest = (turn_to_nest + math.pi) % (2 * math.pi) - math.pi
-                action = AntAction(
-                    turn=turn_to_nest * 0.5,
-                    speed_mult=1.0,
-                    deposit_pheromone=action.deposit_pheromone,
-                    deposit_strength=action.deposit_strength,
-                    pickup=action.pickup,
-                    drop=action.drop,
-                    recruit_signal=action.recruit_signal,
-                )
+            # Survival homing removed — PPO training should never override the policy
+            # The policy must learn survival behavior on its own.
 
             update_heading(ant, action)
             advance_position(ant, action, world)

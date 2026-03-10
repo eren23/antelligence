@@ -34,6 +34,10 @@ from brains.nn_brain import (
     compute_reward,
     _discounted_returns,
 )
+from brains.transformer_backprop import (
+    transformer_forward_with_cache,
+    transformer_backward,
+)
 from config import TransformerBrainConfig
 
 
@@ -328,9 +332,8 @@ class SharedWeightRegistry:
 class RoleTrainer:
     """REINFORCE trainer for a single role's shared transformer weights.
 
-    Uses zeroth-order policy gradient estimation: computes scalar REINFORCE
-    signal from discounted returns and log-probs, then perturbs all parameters
-    in the gradient direction scaled by that signal.
+    Uses analytical backpropagation through the transformer to compute
+    policy gradients, replacing the previous zeroth-order random perturbation.
     """
 
     def __init__(
@@ -349,7 +352,6 @@ class RoleTrainer:
         self.baseline_alpha: float = 0.01
         self.warmup_steps = warmup_steps
         self.global_step: int = 0
-        self._update_rng = np.random.default_rng(0)
 
     @property
     def effective_lr(self) -> float:
@@ -358,7 +360,7 @@ class RoleTrainer:
         return self.lr * (self.global_step / max(self.warmup_steps, 1))
 
     def update(self) -> float:
-        """Run one REINFORCE update from the buffer. Returns proxy loss."""
+        """Run one REINFORCE update with analytical backprop. Returns proxy loss."""
         experiences = self.buffer.get_all()
         if len(experiences) < 2:
             return 0.0
@@ -366,8 +368,6 @@ class RoleTrainer:
         self.global_step += 1
 
         rewards = np.array([e.reward for e in experiences])
-        log_probs = np.array([e.log_prob for e in experiences])
-
         returns = _discounted_returns(rewards, self.gamma)
 
         mean_return = float(returns.mean())
@@ -375,17 +375,93 @@ class RoleTrainer:
             self.baseline * (1 - self.baseline_alpha)
             + mean_return * self.baseline_alpha
         )
-
         advantages = returns - self.baseline
 
-        # Policy gradient signal
-        pg_signal = float(-np.mean(log_probs * advantages))
-
+        # Accumulate gradients from each experience via analytical backprop
         lr = self.effective_lr
-        for param in self.weight_set.all_parameters():
-            param += lr * pg_signal * self._update_rng.standard_normal(param.shape)
+        n_params = len(self.weight_set.all_parameters())
+        accumulated_grads = [np.zeros_like(p) for p in self.weight_set.all_parameters()]
+        input_dim = self.weight_set.W_in.shape[0]
+        count = 0
+
+        for exp, adv in zip(experiences, advantages):
+            # Reconstruct input sequence from flattened context
+            vec = exp.sensory_vec
+            if vec.ndim == 1:
+                seq_len = max(1, len(vec) // input_dim)
+                if len(vec) == input_dim * seq_len:
+                    x = vec.reshape(seq_len, input_dim)
+                else:
+                    x = vec[:input_dim].reshape(1, input_dim)
+            else:
+                x = vec
+
+            # Forward with cache
+            logits, cache = transformer_forward_with_cache(self.weight_set, x)
+
+            # Compute REINFORCE logit gradient: ∂log π/∂logits * advantage
+            decoded = decode_output(logits)
+            dL_dlogits = _compute_logit_grad_single(decoded, exp.action, float(adv))
+
+            # Backprop through transformer
+            grads = transformer_backward(self.weight_set, cache, dL_dlogits)
+
+            for i, g in enumerate(grads):
+                accumulated_grads[i] += g
+            count += 1
+
+        if count > 0:
+            # Average and apply gradient ascent
+            for param, grad in zip(self.weight_set.all_parameters(), accumulated_grads):
+                param += lr * grad / count
 
         return float(-np.mean(advantages ** 2))
+
+
+def _compute_logit_grad_single(
+    decoded: dict,
+    action: 'AntAction',
+    advantage: float,
+) -> np.ndarray:
+    """Compute ∂log π(a|s)/∂z_out * advantage for a single sample.
+
+    Returns gradient w.r.t. the 11-dim output logits.
+    """
+    import math as _math
+    dL_dz = np.zeros(_OUTPUT_DIM)
+
+    # Turn head (idx 0): tanh output, Gaussian log-prob
+    t = float(decoded["turn"][0]) / (_math.pi / 6.0)  # recover tanh value
+    t = max(-0.999, min(0.999, t))
+    scale = _math.pi / 6.0
+    sigma_t = 0.1
+    dL_dz[0] = (action.turn - t * scale) * scale * (1 - t**2) / (sigma_t**2) * advantage
+
+    # Speed head (idx 1): sigmoid, Gaussian
+    s = float(decoded["speed"][0])
+    sigma_s = 0.1
+    dL_dz[1] = (action.speed_mult - s) * s * (1 - s) / (sigma_s**2) * advantage
+
+    # Deposit head (idx 2:7): softmax, categorical
+    probs = decoded["deposit_probs"]
+    if hasattr(probs, '__len__'):
+        probs = np.array(probs, dtype=np.float64)
+    deposit_idx = _DEPOSIT_CHANNELS.index(action.deposit_pheromone)
+    grad_dep = -probs.copy()
+    grad_dep[deposit_idx] += 1.0
+    dL_dz[2:7] = grad_dep * advantage
+
+    # Strength head (idx 7): sigmoid, Gaussian
+    st = float(decoded["strength"][0])
+    sigma_st = 0.1
+    dL_dz[7] = (action.deposit_strength - st) * st * (1 - st) / (sigma_st**2) * advantage
+
+    # Binary heads (idx 8, 9, 10): Bernoulli
+    for j, acted in enumerate([action.pickup, action.drop, action.recruit_signal]):
+        sig_val = float(decoded[["pickup", "drop", "recruit"][j]][0])
+        dL_dz[8 + j] = (float(acted) - sig_val) * advantage
+
+    return dL_dz
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +522,8 @@ class TransformerBrain:
     Maintains a sliding context window of the last ``context_length`` sensory
     snapshots and uses a stack of causal transformer layers to produce actions.
     Uses the same multi-head action output as NNBrain (11 logits → decode_output
-    → sample_action). Training uses REINFORCE with a rolling reward buffer.
+    → sample_action). Training uses REINFORCE with analytical backprop.
+    Optionally integrates intrinsic motivation (RND curiosity).
     """
 
     def __init__(
@@ -457,6 +534,8 @@ class TransformerBrain:
         cfg: Optional[TransformerBrainConfig] = None,
         input_dim: int = 39,
         seed: int = 42,
+        intrinsic_combiner: Optional['IntrinsicCombiner'] = None,
+        rnd_explorer: Optional['RNDExplorer'] = None,
     ):
         if cfg is None:
             cfg = TransformerBrainConfig()
@@ -488,6 +567,10 @@ class TransformerBrain:
                 warmup_steps=50,
             )
         self.trainer = trainer
+
+        # Intrinsic motivation (optional)
+        self._intrinsic_combiner = intrinsic_combiner
+        self._rnd_explorer = rnd_explorer
 
         # Sliding context window
         self.context: deque[np.ndarray] = deque(maxlen=cfg.context_length)
@@ -530,15 +613,29 @@ class TransformerBrain:
         return action
 
     def learn(self, reward: float) -> None:
-        """Receive reward signal. Stores experience and periodically trains."""
+        """Receive reward signal. Stores experience and periodically trains.
+
+        If intrinsic motivation is enabled, blends extrinsic reward with
+        RND curiosity signal before storing.
+        """
         if self._prev_action is None or self._prev_context_flat is None:
             return
+
+        # Blend with intrinsic reward if available
+        final_reward = reward
+        if self._rnd_explorer is not None and self._intrinsic_combiner is not None:
+            # Use the last sensory vector (last row of context) for RND
+            input_dim = self.input_dim
+            last_vec = self._prev_context_flat[-input_dim:]
+            intrinsic = self._rnd_explorer.intrinsic_reward(last_vec)
+            final_reward = self._intrinsic_combiner.combine(reward, intrinsic)
+            self._rnd_explorer.update(last_vec)
 
         exp = Experience(
             sensory_vec=self._prev_context_flat,
             action=self._prev_action,
             log_prob=self._prev_log_prob,
-            reward=reward,
+            reward=final_reward,
         )
         self.trainer.buffer.add(exp)
 

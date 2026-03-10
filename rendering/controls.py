@@ -32,7 +32,7 @@ class ControlState:
     # Simulation
     paused: bool = False
     speed_index: int = 1                          # index into SPEED_PRESETS
-    brain_type: str = "rule_based"                # "rule_based" | "nn" | "transformer" | "mlx_nn" | "mlx_transformer"
+    brain_type: str = "rule_based"                # "rule_based" | "nn" | "transformer" | "torch_nn" | "torch_transformer"
     quit_requested: bool = False
 
     # Pheromone overlay toggles (one per channel, index 0-3)
@@ -157,11 +157,11 @@ def _handle_keydown(
         state.brain_type = "nn"
     elif key == pygame.K_t:
         if mods & pygame.KMOD_SHIFT:
-            state.brain_type = "mlx_transformer"
+            state.brain_type = "torch_transformer"
         else:
             state.brain_type = "transformer"
     elif key == pygame.K_m:
-        state.brain_type = "mlx_nn"
+        state.brain_type = "torch_nn"
 
     # Overlays
     elif key == pygame.K_s:

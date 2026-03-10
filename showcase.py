@@ -120,7 +120,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Record showcase demo video")
     p.add_argument("--load-weights", type=str, default=None,
                    help="Directory with trained weights")
-    p.add_argument("--brain", choices=["nn", "transformer", "mlx_nn", "mlx_transformer", "rule_based"],
+    p.add_argument("--brain", choices=["nn", "transformer", "torch_nn", "torch_transformer", "rule_based"],
                    default="nn", help="Brain backend (default: nn)")
     p.add_argument("--output", "-o", type=str, default="showcase.mp4",
                    help="Output video path (default: showcase.mp4)")

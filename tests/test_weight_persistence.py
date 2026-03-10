@@ -3,8 +3,8 @@
 Verifies:
 - NN weight save/load roundtrip (weights match after reload)
 - Transformer weight save/load roundtrip
-- MLX NN weight save/load roundtrip (if MLX available)
-- MLX Transformer weight save/load roundtrip (if MLX available)
+- Torch NN weight save/load roundtrip (if torch available)
+- Torch Transformer weight save/load roundtrip (if torch available)
 - Trainer state (baseline, global_step) preservation
 - Load from nonexistent directory → graceful warning
 - Weights survive across a BrainManager pair (save from one, load into fresh)
@@ -13,7 +13,6 @@ Verifies:
 from __future__ import annotations
 
 import json
-import random
 from pathlib import Path
 
 import numpy as np
@@ -21,13 +20,6 @@ import pytest
 
 from config import default_config
 from main import BrainManager
-
-# Check MLX availability
-try:
-    import mlx.core as mx
-    _MLX_AVAILABLE = True
-except ImportError:
-    _MLX_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -51,14 +43,14 @@ def _init_tf(mgr: BrainManager) -> None:
     mgr._ensure_tf()
 
 
-def _init_mlx_nn(mgr: BrainManager) -> None:
-    """Force-initialize the MLX NN registry and trainers."""
-    mgr._ensure_mlx_nn()
+def _init_torch_nn(mgr: BrainManager) -> None:
+    """Force-initialize the torch NN registry and trainers."""
+    mgr._ensure_torch_nn()
 
 
-def _init_mlx_tf(mgr: BrainManager) -> None:
-    """Force-initialize the MLX transformer registry and trainers."""
-    mgr._ensure_mlx_tf()
+def _init_torch_tf(mgr: BrainManager) -> None:
+    """Force-initialize the torch transformer registry and trainers."""
+    mgr._ensure_torch_tf()
 
 
 # ---------------------------------------------------------------------------
@@ -170,76 +162,93 @@ class TestTransformerWeightPersistence:
 
 
 # ---------------------------------------------------------------------------
-# MLX NN weight persistence
+# Torch NN weight persistence
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _MLX_AVAILABLE, reason="MLX not available")
-class TestMLXNNWeightPersistence:
-    """Save and reload MLX NN weights."""
+class TestTorchNNWeightPersistence:
+    """Save and reload torch NN weights."""
 
     def test_roundtrip_weights_match(self, tmp_path: Path):
-        mgr = _make_brain_mgr("mlx_nn")
-        _init_mlx_nn(mgr)
-
-        # Snapshot original params as numpy
+        mgr = _make_brain_mgr("torch_nn")
+        _init_torch_nn(mgr)
+        import torch
         originals: dict[str, dict[str, np.ndarray]] = {}
-        for role in mgr._mlx_nn_registry.roles():
-            model = mgr._mlx_nn_registry.get(role)
-            from main import _flatten_mlx_params
+        for role in mgr._torch_nn_registry.roles():
+            model = mgr._torch_nn_registry.get(role)
             originals[role] = {
-                k: v.copy() for k, v in _flatten_mlx_params(model.parameters()).items()
+                k: v.detach().cpu().numpy().copy()
+                for k, v in model.state_dict().items()
             }
 
         mgr.save_weights(tmp_path / "weights")
 
-        mgr2 = _make_brain_mgr("mlx_nn")
-        _init_mlx_nn(mgr2)
+        mgr2 = _make_brain_mgr("torch_nn")
+        _init_torch_nn(mgr2)
         mgr2.load_weights(tmp_path / "weights")
 
         for role in originals:
-            model2 = mgr2._mlx_nn_registry.get(role)
-            loaded = _flatten_mlx_params(model2.parameters())
+            model2 = mgr2._torch_nn_registry.get(role)
+            loaded = model2.state_dict()
             for key in originals[role]:
-                np.testing.assert_array_almost_equal(
-                    loaded[key], originals[role][key],
-                    err_msg=f"MLX NN {role} {key} mismatch",
+                assert key in loaded, f"Missing key {key} in loaded torch_nn state"
+                np.testing.assert_allclose(
+                    loaded[key].detach().cpu().numpy(),
+                    originals[role][key],
+                    err_msg=f"Torch NN {role} {key} mismatch",
                 )
 
+    def test_weight_files_created(self, tmp_path: Path):
+        mgr = _make_brain_mgr("torch_nn")
+        _init_torch_nn(mgr)
+        mgr.save_weights(tmp_path / "weights")
+        npz_files = list((tmp_path / "weights").glob("torch_nn_*.npz"))
+        assert len(npz_files) >= 4, f"Expected ≥4 torch_nn weight files, got {len(npz_files)}"
+
 
 # ---------------------------------------------------------------------------
-# MLX Transformer weight persistence
+# Torch Transformer weight persistence
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _MLX_AVAILABLE, reason="MLX not available")
-class TestMLXTransformerWeightPersistence:
-    """Save and reload MLX Transformer weights."""
+class TestTorchTransformerWeightPersistence:
+    """Save and reload torch transformer weights."""
 
     def test_roundtrip_weights_match(self, tmp_path: Path):
-        mgr = _make_brain_mgr("mlx_transformer")
-        _init_mlx_tf(mgr)
+        mgr = _make_brain_mgr("torch_transformer")
+        _init_torch_tf(mgr)
 
         originals: dict[str, dict[str, np.ndarray]] = {}
-        for role in mgr._mlx_tf_registry.roles():
-            model = mgr._mlx_tf_registry.get(role)
-            from main import _flatten_mlx_params
+        for role in mgr._torch_tf_registry.roles():
+            model = mgr._torch_tf_registry.get(role)
             originals[role] = {
-                k: v.copy() for k, v in _flatten_mlx_params(model.parameters()).items()
+                k: v.detach().cpu().numpy().copy()
+                for k, v in model.state_dict().items()
             }
 
         mgr.save_weights(tmp_path / "weights")
 
-        mgr2 = _make_brain_mgr("mlx_transformer")
-        _init_mlx_tf(mgr2)
+        mgr2 = _make_brain_mgr("torch_transformer")
+        _init_torch_tf(mgr2)
         mgr2.load_weights(tmp_path / "weights")
 
         for role in originals:
-            model2 = mgr2._mlx_tf_registry.get(role)
-            loaded = _flatten_mlx_params(model2.parameters())
+            model2 = mgr2._torch_tf_registry.get(role)
+            loaded = model2.state_dict()
             for key in originals[role]:
-                np.testing.assert_array_almost_equal(
-                    loaded[key], originals[role][key],
-                    err_msg=f"MLX Transformer {role} {key} mismatch",
+                assert key in loaded, f"Missing key {key} in loaded torch_transformer state"
+                np.testing.assert_allclose(
+                    loaded[key].detach().cpu().numpy(),
+                    originals[role][key],
+                    err_msg=f"Torch Transformer {role} {key} mismatch",
                 )
+
+    def test_weight_files_created(self, tmp_path: Path):
+        mgr = _make_brain_mgr("torch_transformer")
+        _init_torch_tf(mgr)
+        mgr.save_weights(tmp_path / "weights")
+        npz_files = list((tmp_path / "weights").glob("torch_transformer_*.npz"))
+        assert len(npz_files) >= 4, (
+            f"Expected ≥4 torch_transformer weight files, got {len(npz_files)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +306,42 @@ class TestTrainerStatePersistence:
         for role, trainer in mgr2._tf_trainers.items():
             assert trainer.baseline == 0.456
             assert trainer.global_step == 2000
+
+    def test_torch_nn_trainer_state(self, tmp_path: Path):
+        mgr = _make_brain_mgr("torch_nn")
+        _init_torch_nn(mgr)
+
+        for trainer in mgr._torch_nn_trainers.values():
+            trainer.baseline = 0.789
+            trainer.global_step = 1234
+
+        mgr.save_weights(tmp_path / "weights")
+
+        mgr2 = _make_brain_mgr("torch_nn")
+        _init_torch_nn(mgr2)
+        mgr2.load_weights(tmp_path / "weights")
+
+        for trainer in mgr2._torch_nn_trainers.values():
+            assert trainer.baseline == 0.789
+            assert trainer.global_step == 1234
+
+    def test_torch_transformer_trainer_state(self, tmp_path: Path):
+        mgr = _make_brain_mgr("torch_transformer")
+        _init_torch_tf(mgr)
+
+        for trainer in mgr._torch_tf_trainers.values():
+            trainer.baseline = 0.987
+            trainer.global_step = 4321
+
+        mgr.save_weights(tmp_path / "weights")
+
+        mgr2 = _make_brain_mgr("torch_transformer")
+        _init_torch_tf(mgr2)
+        mgr2.load_weights(tmp_path / "weights")
+
+        for trainer in mgr2._torch_tf_trainers.values():
+            assert trainer.baseline == 0.987
+            assert trainer.global_step == 4321
 
 
 # ---------------------------------------------------------------------------

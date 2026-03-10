@@ -10,6 +10,7 @@ import numpy as np
 
 from agents.actions import AntAction
 from agents.sensory import SensoryInput
+from brains.intrinsic import IntrinsicCombiner, RNDExplorer
 from config import NNBrainConfig
 
 
@@ -663,6 +664,7 @@ class NNBrain:
 
     Uses shared weights from a SharedWeightRegistry (per role) and
     maintains a per-ant experience buffer for REINFORCE training.
+    Optionally integrates intrinsic motivation (RND curiosity).
 
     Satisfies the BrainBackend protocol (decide + learn).
     """
@@ -674,6 +676,8 @@ class NNBrain:
         trainer: RoleTrainer | None = None,
         cfg: NNBrainConfig | None = None,
         seed: int | None = None,
+        intrinsic_combiner: 'IntrinsicCombiner | None' = None,
+        rnd_explorer: 'RNDExplorer | None' = None,
     ):
         if cfg is None:
             cfg = NNBrainConfig()
@@ -702,6 +706,10 @@ class NNBrain:
             )
         self.trainer = trainer
 
+        # Intrinsic motivation (optional)
+        self._intrinsic_combiner = intrinsic_combiner
+        self._rnd_explorer = rnd_explorer
+
         # Per-ant state
         self._prev_sensory: SensoryInput | None = None
         self._prev_action: AntAction | None = None
@@ -726,15 +734,26 @@ class NNBrain:
         return action
 
     def learn(self, reward: float) -> None:
-        """Receive reward signal. Stores experience and periodically trains."""
+        """Receive reward signal. Stores experience and periodically trains.
+
+        If intrinsic motivation is enabled, blends extrinsic reward with
+        RND curiosity signal before storing.
+        """
         if self._prev_action is None or self._prev_vec is None:
             return
+
+        # Blend with intrinsic reward if available
+        final_reward = reward
+        if self._rnd_explorer is not None and self._intrinsic_combiner is not None:
+            intrinsic = self._rnd_explorer.intrinsic_reward(self._prev_vec)
+            final_reward = self._intrinsic_combiner.combine(reward, intrinsic)
+            self._rnd_explorer.update(self._prev_vec)
 
         exp = Experience(
             sensory_vec=self._prev_vec,
             action=self._prev_action,
             log_prob=self._prev_log_prob,
-            reward=reward,
+            reward=final_reward,
         )
         self.trainer.buffer.add(exp)
         self._step_count += 1

@@ -1,6 +1,6 @@
 # Ant Colony Simulation
 
-A biologically-inspired ant colony simulation featuring emergent collective behaviors, multiple brain backends (rule-based, neural network, transformer), and real-time visualization.
+A biologically-inspired ant colony simulation featuring emergent collective behaviors, multiple brain backends (rule-based, NumPy and torch neural networks/transformers), and real-time visualization.
 
 ## Architecture Overview
 
@@ -36,9 +36,6 @@ Build Sensory Inputs
 ```bash
 pip install -r requirements.txt
 
-# Optional: MLX for Apple Silicon GPU-accelerated brains
-pip install mlx
-
 # Dev dependencies (tests)
 pip install -r requirements-dev.txt
 ```
@@ -53,8 +50,8 @@ Requires Python 3.9+.
 python3 main.py                          # Default: rule-based brain, seed 42
 python3 main.py --brain nn               # Neural network brain
 python3 main.py --brain transformer      # Transformer brain
-python3 main.py --brain mlx_nn           # MLX-accelerated NN (Apple Silicon)
-python3 main.py --brain mlx_transformer  # MLX-accelerated transformer
+python3 main.py --brain torch_nn         # PyTorch neural network brain
+python3 main.py --brain torch_transformer  # PyTorch transformer brain
 python3 main.py --seed 123 --ants 500    # Custom seed and population
 python3 main.py --config my_config.yaml  # Custom configuration
 ```
@@ -69,8 +66,25 @@ python3 main.py --headless --ticks 5000 --report results.json
 ### Brain Comparison
 
 ```bash
-python3 compare_brains.py  # Compare all brain types across multiple seeds
+python3 compare_brains.py --brains nn torch_nn transformer torch_transformer
 ```
+
+### Google Colab Worker
+
+Use Colab as a remote worker for torch benchmarks:
+
+1. Open [colab/torch_benchmark_worker.ipynb](colab/torch_benchmark_worker.ipynb) in Google Colab.
+2. Set parameters in the first code cell (`REPO_URL`, `BRANCH`, `TICKS`, `SEEDS`, `ANTS`).
+3. Run all cells. The notebook mounts Google Drive, syncs the repo branch, and runs:
+
+```bash
+bash scripts/colab_benchmark.sh --ticks ... --seeds ... --ants ... --out-dir ...
+```
+
+Artifacts are written to Drive (timestamped run folder):
+- `migration.json` (full compare output)
+- `migration_check.json` (torch migration pass/fail summary)
+- `run_meta.json` (commit, device, thresholds, run parameters)
 
 ### CLI Arguments
 
@@ -102,8 +116,8 @@ python3 compare_brains.py  # Compare all brain types across multiple seeds
 | R | Rule-based |
 | N | Neural network (NumPy) |
 | T | Transformer (NumPy) |
-| M | MLX neural network |
-| Shift+T | MLX transformer |
+| M | Neural network (PyTorch) |
+| Shift+T | Transformer (PyTorch) |
 
 ### Pheromone Overlays
 
@@ -228,19 +242,19 @@ Pure NumPy causal transformer with temporal context:
 - Sinusoidal positional encoding, causal attention masking
 - REINFORCE training via zeroth-order perturbation
 
-### MLX Neural Network (`mlx_nn`)
+### PyTorch Neural Network (`torch_nn`)
 
-Apple Silicon GPU-accelerated version of the NN brain:
-- Same architecture as `nn` but uses MLX framework
-- MLX auto-differentiation replaces hand-rolled gradients
-- Requires `pip install mlx`
+PyTorch implementation of the NN brain:
+- Same action head layout as `nn`
+- Auto-differentiation and optimizer support via torch
+- Device auto-detection (CUDA > MPS > CPU)
 
-### MLX Transformer (`mlx_transformer`)
+### PyTorch Transformer (`torch_transformer`)
 
-Apple Silicon GPU-accelerated version of the transformer brain:
-- Same architecture as `transformer` but uses MLX framework
-- `mlx.nn.MultiHeadAttention` for efficient attention computation
-- Requires `pip install mlx`
+PyTorch implementation of the transformer brain:
+- Same high-level architecture as `transformer`
+- Causal attention with torch modules
+- Device auto-detection (CUDA > MPS > CPU)
 
 ## Emergent Behaviors
 
@@ -270,9 +284,6 @@ python3 -m pytest tests/test_emergence.py -v
 # Replay determinism tests
 python3 -m pytest tests/test_replay.py -v
 
-# MLX brain tests (skipped if MLX not installed)
-python3 -m pytest tests/test_mlx_brains.py -v
-
 # Specific test file
 python3 -m pytest tests/test_rule_brain.py -v
 ```
@@ -289,7 +300,6 @@ Test files:
 | `test_rule_brain.py` | State machines, steering, role rebalancing |
 | `test_nn_brain.py` | NN forward pass, learning, weight sharing |
 | `test_transformer_brain.py` | Attention, context window, training |
-| `test_mlx_brains.py` | MLX NN and transformer (requires MLX) |
 | `test_emergence.py` | Emergent behavior integration tests |
 | `test_replay.py` | Save/load, deterministic replay |
 
@@ -349,7 +359,7 @@ world:
 - **Rule-based**: ~1000+ ants at 60 FPS (real-time)
 - **NN (NumPy)**: ~300 ants at real-time; shared weights amortize memory
 - **Transformer (NumPy)**: ~200 ants at real-time; context window limits throughput
-- **MLX NN/Transformer**: Faster than NumPy equivalents on Apple Silicon via Metal GPU
+- **Torch NN/Transformer**: Hardware-accelerated where CUDA/MPS is available
 
 Headless mode runs significantly faster (no rendering overhead). Use `--headless` for experiments.
 
@@ -375,6 +385,5 @@ Headless mode runs significantly faster (no rendering overhead). Use `--headless
 - Pheromone grid resolution (4px cells) limits fine-grained trail formation
 - No inter-colony competition or predator agents
 - Transformer context window is fixed-length (no variable attention span)
-- MLX backends require Apple Silicon; no CUDA/ROCm support
 
 See [ROADMAP.md](ROADMAP.md) for the GPU training plan and future phases.

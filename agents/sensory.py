@@ -11,6 +11,7 @@ from agents.ant import Vec2
 if TYPE_CHECKING:
     from agents.ant import Ant
     from config import AntConfig
+    from world.spatial import SpatialGrid
     from world.world import World
     from world.pheromone import PheromoneGrid
 
@@ -204,21 +205,39 @@ def _find_neighbors(
     ant: Ant,
     all_ants: list[Ant],
     radius: float,
+    spatial_grid: SpatialGrid | None = None,
 ) -> list[NeighborInfo]:
-    """Find alive ants within *radius* of *ant* (excluding self)."""
-    radius_sq = radius * radius
+    """Find alive ants within *radius* of *ant* (excluding self).
+
+    If *spatial_grid* is provided, uses O(k) spatial lookup instead of O(n) scan.
+    """
     neighbors: list[NeighborInfo] = []
-    for other in all_ants:
-        if other.id == ant.id or not other.alive:
-            continue
-        rel = other.pos - ant.pos
-        if rel.length_sq() <= radius_sq:
+
+    if spatial_grid is not None:
+        candidates = spatial_grid.query_radius(ant.pos, radius)
+        for other in candidates:
+            if other.id == ant.id:
+                continue
+            rel = other.pos - ant.pos
             neighbors.append(NeighborInfo(
                 id=other.id,
                 relative_pos=rel,
                 role_value=other.role.value,
                 carrying=other.carrying,
             ))
+    else:
+        radius_sq = radius * radius
+        for other in all_ants:
+            if other.id == ant.id or not other.alive:
+                continue
+            rel = other.pos - ant.pos
+            if rel.length_sq() <= radius_sq:
+                neighbors.append(NeighborInfo(
+                    id=other.id,
+                    relative_pos=rel,
+                    role_value=other.role.value,
+                    carrying=other.carrying,
+                ))
     return neighbors
 
 
@@ -290,6 +309,8 @@ def build_sensory(
     pheromone_grid: PheromoneGrid,
     all_ants: list[Ant],
     cfg: AntConfig,
+    *,
+    spatial_grid: SpatialGrid | None = None,
 ) -> SensoryInput:
     """Build a complete SensoryInput for *ant* from current world state."""
     antenna_angle_rad = cfg.antenna_angle_rad
@@ -321,7 +342,7 @@ def build_sensory(
     nest_bearing = (nest_bearing + math.pi) % (2 * math.pi) - math.pi
 
     # Neighbors
-    neighbors = _find_neighbors(ant, all_ants, cfg.neighbor_radius)
+    neighbors = _find_neighbors(ant, all_ants, cfg.neighbor_radius, spatial_grid)
 
     # Food gradient
     food_gradient = _compute_food_gradient(ant.pos, pheromone_grid)
