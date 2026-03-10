@@ -2,12 +2,14 @@
 set -euo pipefail
 
 # Usage example:
-#   bash scripts/colab_benchmark.sh --ticks 5000 --seeds "42 123 7" --ants 200 --out-dir /tmp/run --skip-install
+#   bash scripts/colab_benchmark.sh --mode torch_only --ticks 5000 --seeds "42 123 7" --ants 200 --out-dir /tmp/run --skip-install
 
 REPO_URL=""
 BRANCH=""
 WORKDIR="/content/work"
+MODE="full"
 TICKS=5000
+WARMUP_TICKS=0
 SEEDS="42 123 7"
 ANTS=200
 OUT_DIR=""
@@ -24,8 +26,12 @@ while [[ $# -gt 0 ]]; do
       BRANCH="$2"; shift 2 ;;
     --workdir)
       WORKDIR="$2"; shift 2 ;;
+    --mode)
+      MODE="$2"; shift 2 ;;
     --ticks)
       TICKS="$2"; shift 2 ;;
+    --warmup-ticks)
+      WARMUP_TICKS="$2"; shift 2 ;;
     --seeds)
       SEEDS="$2"; shift 2 ;;
     --ants)
@@ -45,6 +51,11 @@ while [[ $# -gt 0 ]]; do
       exit 2 ;;
   esac
 done
+
+if [[ "$MODE" != "full" && "$MODE" != "torch_only" ]]; then
+  echo "--mode must be one of: full, torch_only" >&2
+  exit 2
+fi
 
 if [[ -n "$REPO_URL" ]]; then
   mkdir -p "$WORKDIR"
@@ -72,21 +83,46 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
   python3 -m pip install -q -r requirements.txt
 fi
 
+if [[ "$MODE" == "torch_only" ]]; then
+  BRAINS="torch_nn torch_transformer"
+else
+  BRAINS="nn torch_nn transformer torch_transformer"
+fi
+
+if [[ "$WARMUP_TICKS" -gt 0 ]]; then
+  FIRST_SEED="$(echo "$SEEDS" | awk '{print $1}')"
+  python3 compare_brains.py \
+    --brains $BRAINS \
+    --torch-batch-policy on \
+    --ticks "$WARMUP_TICKS" \
+    --seeds "$FIRST_SEED" \
+    --ants "$ANTS" \
+    --config "$CONFIG" \
+    --quiet \
+    --out "$OUT_DIR/warmup.json" >/dev/null
+fi
+
 python3 compare_brains.py \
-  --brains nn torch_nn transformer torch_transformer \
+  --brains $BRAINS \
+  --torch-batch-policy on \
   --ticks "$TICKS" \
   --seeds $SEEDS \
   --ants "$ANTS" \
   --config "$CONFIG" \
   --out "$OUT_DIR/migration.json"
 
-python3 scripts/check_torch_migration.py \
-  --input "$OUT_DIR/migration.json" \
-  --max-food-drop "$MAX_FOOD_DROP" \
-  --max-death-increase "$MAX_DEATH_INCREASE" \
+CHECK_ARGS=(
+  --input "$OUT_DIR/migration.json"
+  --max-food-drop "$MAX_FOOD_DROP"
+  --max-death-increase "$MAX_DEATH_INCREASE"
   --output "$OUT_DIR/migration_check.json"
+)
+if [[ "$MODE" == "torch_only" ]]; then
+  CHECK_ARGS+=(--allow-missing-pairs)
+fi
+python3 scripts/check_torch_migration.py "${CHECK_ARGS[@]}"
 
-python3 - "$OUT_DIR" "$TICKS" "$SEEDS" "$ANTS" "$MAX_FOOD_DROP" "$MAX_DEATH_INCREASE" <<'PY'
+python3 - "$OUT_DIR" "$TICKS" "$SEEDS" "$ANTS" "$MAX_FOOD_DROP" "$MAX_DEATH_INCREASE" "$MODE" "$WARMUP_TICKS" <<'PY'
 import json
 import pathlib
 import subprocess
@@ -101,6 +137,8 @@ meta = {
         "max_food_drop": float(sys.argv[5]),
         "max_death_increase": float(sys.argv[6]),
     },
+    "mode": sys.argv[7],
+    "warmup_ticks": int(sys.argv[8]),
 }
 
 try:
@@ -129,6 +167,24 @@ except Exception as e:
 out_dir.mkdir(parents=True, exist_ok=True)
 (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
 print(json.dumps(meta, indent=2))
+
+migration = json.loads((out_dir / "migration.json").read_text())
+perf_summary = {
+    "mode": meta["mode"],
+    "ticks": meta["ticks"],
+    "seeds": meta["seeds"],
+    "brains": {},
+}
+for brain, reports in migration.items():
+    if not reports:
+        continue
+    avg_tps = sum(float(r["performance"]["ticks_per_second"]) for r in reports) / len(reports)
+    avg_wall = sum(float(r["performance"]["wall_time_seconds"]) for r in reports) / len(reports)
+    perf_summary["brains"][brain] = {
+        "avg_ticks_per_second": round(avg_tps, 3),
+        "avg_wall_time_seconds": round(avg_wall, 3),
+    }
+(out_dir / "perf_summary.json").write_text(json.dumps(perf_summary, indent=2))
 PY
 
 echo
@@ -136,3 +192,4 @@ echo "Artifacts saved to: $OUT_DIR"
 echo "  - $OUT_DIR/migration.json"
 echo "  - $OUT_DIR/migration_check.json"
 echo "  - $OUT_DIR/run_meta.json"
+echo "  - $OUT_DIR/perf_summary.json"

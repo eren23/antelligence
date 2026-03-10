@@ -55,6 +55,9 @@ from brains.nn_brain import (
     SharedWeightRegistry as NNWeightRegistry,
     RoleTrainer as NNRoleTrainer,
     compute_reward,
+    decode_output,
+    sample_action,
+    log_prob_of_action,
 )
 from brains.reward import SparseReward
 from brains.rule_based import RuleBasedBrain
@@ -636,8 +639,11 @@ def sim_tick(
     cfg: SimConfig,
     *,
     learn: bool = True,
+    torch_batch_policy: str = "auto",
+    perf_stats: dict[str, float] | None = None,
 ) -> None:
     """Execute one simulation tick (the full per-tick pipeline)."""
+    t_tick_start = _time.perf_counter() if perf_stats is not None else 0.0
     ants = colony.ants
 
     # Build spatial grid for O(n) neighbor lookups
@@ -670,12 +676,99 @@ def sim_tick(
             metrics.accumulate_reward(reward)
 
     # 3. Brain decides
+    t_policy_start = _time.perf_counter() if perf_stats is not None else 0.0
     actions: dict[int, AntAction] = {}
+
+    # Phase 1 GPU path: batch torch policy inference by role
+    use_batched_torch = (
+        _TORCH_AVAILABLE
+        and torch_batch_policy in ("auto", "on")
+    )
+    if use_batched_torch:
+        try:
+            import torch as _torch
+
+            nn_groups: dict[str, list[Ant]] = {}
+            tf_groups: dict[str, list[Ant]] = {}
+            for ant in ants:
+                if not ant.alive or ant.brain is None or ant.sensory is None:
+                    continue
+                if isinstance(ant.brain, TorchNNBrain):
+                    nn_groups.setdefault(ant.role.value, []).append(ant)
+                elif isinstance(ant.brain, TorchTransformerBrain):
+                    tf_groups.setdefault(ant.role.value, []).append(ant)
+
+            # Batched torch NN forward pass per role
+            for role, group in nn_groups.items():
+                if not group:
+                    continue
+                model = group[0].brain.model
+                device = next(model.parameters()).device
+                vecs64 = [np.array(ant.sensory.to_vector(), dtype=np.float64) for ant in group]
+                batch = np.stack([v.astype(np.float32, copy=False) for v in vecs64], axis=0)
+                with _torch.no_grad():
+                    x = _torch.tensor(batch, dtype=_torch.float32, device=device)
+                    logits, _ = model(x)
+                    raw = logits.detach().cpu().numpy()
+                for ant, vec64, raw_np in zip(group, vecs64, raw):
+                    decoded = decode_output(raw_np)
+                    action = sample_action(decoded, ant.brain.rng)
+                    lp = log_prob_of_action(decoded, action)
+                    ant.brain._prev_sensory = ant.sensory
+                    ant.brain._prev_action = action
+                    ant.brain._prev_log_prob = lp
+                    ant.brain._prev_vec = vec64
+                    ant.brain._step_count += 1
+                    actions[ant.id] = action
+
+            # Batched torch transformer forward pass by role + seq_len
+            for role, group in tf_groups.items():
+                if not group:
+                    continue
+                model = group[0].brain.model
+                device = next(model.parameters()).device
+                seq_buckets: dict[int, list[tuple[Ant, np.ndarray, np.ndarray]]] = {}
+                for ant in group:
+                    vec64 = np.array(ant.sensory.to_vector(), dtype=np.float64)
+                    ant.brain.context.append(vec64)
+                    ctx = np.stack(list(ant.brain.context), axis=0)
+                    seq_buckets.setdefault(ctx.shape[0], []).append((ant, vec64, ctx))
+
+                for seq_len, items in seq_buckets.items():
+                    x_np = np.stack(
+                        [ctx.astype(np.float32, copy=False) for _, _, ctx in items],
+                        axis=0,
+                    )
+                    with _torch.no_grad():
+                        x = _torch.tensor(x_np, dtype=_torch.float32, device=device)
+                        logits, _ = model(x)
+                        raw = logits.detach().cpu().numpy()
+
+                    for (ant, _vec64, ctx), raw_np in zip(items, raw):
+                        decoded = decode_output(raw_np)
+                        action = sample_action(decoded, ant.brain.rng)
+                        lp = log_prob_of_action(decoded, action)
+                        ant.brain._prev_sensory = ant.sensory
+                        ant.brain._prev_action = action
+                        ant.brain._prev_log_prob = lp
+                        ant.brain._prev_context_flat = ctx.flatten()
+                        ant.brain._prev_seq_len = ctx.shape[0]
+                        ant.brain._step_count += 1
+                        actions[ant.id] = action
+        except Exception:
+            # Safety fallback: keep simulation running if batching path fails.
+            if torch_batch_policy == "on":
+                raise
+
     for ant in ants:
+        if ant.id in actions:
+            continue
         if ant.alive and ant.brain is not None and ant.sensory is not None:
             actions[ant.id] = ant.brain.decide(ant.sensory)
         else:
             actions[ant.id] = AntAction()
+    if perf_stats is not None:
+        perf_stats["policy_s"] = perf_stats.get("policy_s", 0.0) + (_time.perf_counter() - t_policy_start)
 
     # 4. Apply actions — physics, movement, interactions
     for ant in ants:
@@ -784,6 +877,8 @@ def sim_tick(
 
     # 11. Update emergence detectors
     emergence.update(tick, colony, world, pheromone_grid, snapshot.food_income)
+    if perf_stats is not None:
+        perf_stats["tick_s"] = perf_stats.get("tick_s", 0.0) + (_time.perf_counter() - t_tick_start)
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +893,7 @@ def run_headless(
     ants: int | None = None,
     config_path: str = "colony_config.yaml",
     verbose: bool = True,
+    torch_batch_policy: str = "auto",
 ) -> dict[str, Any]:
     """Run a headless simulation and return a JSON-serializable report dict.
 
@@ -830,16 +926,35 @@ def run_headless(
 
     # ---- Run simulation ----
     t_start = _time.perf_counter()
+    perf_stats: dict[str, float] = {"tick_s": 0.0, "policy_s": 0.0}
 
     for tick in range(1, ticks + 1):
-        sim_tick(tick, colony, world, pheromone_grid, brain_mgr, metrics, emergence, cfg)
+        sim_tick(
+            tick,
+            colony,
+            world,
+            pheromone_grid,
+            brain_mgr,
+            metrics,
+            emergence,
+            cfg,
+            torch_batch_policy=torch_batch_policy,
+            perf_stats=perf_stats,
+        )
 
         if verbose and tick % 1000 == 0:
             stats = colony.stats()
+            elapsed = _time.perf_counter() - t_start
+            avg_tick_ms = (perf_stats["tick_s"] / tick) * 1000.0 if tick > 0 else 0.0
+            avg_policy_ms = (perf_stats["policy_s"] / tick) * 1000.0 if tick > 0 else 0.0
+            tps = tick / elapsed if elapsed > 0 else 0.0
             print(
                 f"  [{brain}] Tick {tick:>8,}  |  Pop {stats.population:>4}"
                 f"  |  Food {stats.food_stored:>8.1f}"
                 f"  |  Deaths {stats.dead_count:>5}"
+                f"  |  {tps:>6.1f} t/s"
+                f"  |  sim {avg_tick_ms:>6.2f} ms"
+                f"  |  policy {avg_policy_ms:>6.2f} ms"
             )
 
     t_elapsed = _time.perf_counter() - t_start
@@ -925,6 +1040,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Load pre-trained weights from DIR on startup")
     p.add_argument("--autosave-interval", type=int, default=0,
                    help="Auto-save weights every N ticks (0 = disabled)")
+    p.add_argument(
+        "--torch-batch-policy",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Torch policy batching mode for action inference (default: auto)",
+    )
     return p.parse_args(argv)
 
 
@@ -947,6 +1068,7 @@ def main(argv: list[str] | None = None) -> None:
             ants=args.ants,
             config_path=args.config,
             verbose=True,
+            torch_batch_policy=args.torch_batch_policy,
         )
         if args.report:
             rpath = Path(args.report)
@@ -1032,6 +1154,7 @@ def main(argv: list[str] | None = None) -> None:
                     sim_tick(
                         tick, colony, world, pheromone_grid,
                         brain_mgr, metrics, emergence, cfg,
+                        torch_batch_policy=args.torch_batch_policy,
                     )
                     tick_accumulator -= 1.0
 

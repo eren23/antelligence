@@ -75,6 +75,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Check torch migration quality against numpy baselines")
     p.add_argument("--input", required=True, help="compare_brains.py JSON file")
     p.add_argument("--output", default=None, help="Optional JSON output path")
+    p.add_argument(
+        "--pairs",
+        nargs="*",
+        default=[],
+        help="Optional pair list in base:torch format (default: nn:torch_nn transformer:torch_transformer)",
+    )
+    p.add_argument(
+        "--allow-missing-pairs",
+        action="store_true",
+        help="Treat missing pair data as skipped instead of failed",
+    )
     p.add_argument("--max-food-drop", type=float, default=0.20,
                    help="Maximum allowed relative food drop (default: 0.20)")
     p.add_argument("--max-death-increase", type=float, default=0.20,
@@ -89,6 +100,20 @@ def main() -> int:
     with open(in_path) as f:
         results: dict[str, list[dict[str, Any]]] = json.load(f)
 
+    pairs: list[tuple[str, str]] = []
+    if args.pairs:
+        for pair in args.pairs:
+            if ":" not in pair:
+                raise SystemExit(f"invalid --pairs entry '{pair}', expected base:torch")
+            base, torch_name = pair.split(":", 1)
+            base = base.strip()
+            torch_name = torch_name.strip()
+            if not base or not torch_name:
+                raise SystemExit(f"invalid --pairs entry '{pair}', expected base:torch")
+            pairs.append((base, torch_name))
+    else:
+        pairs = list(PAIRS)
+
     checks = [
         _pair_check(
             results,
@@ -97,14 +122,19 @@ def main() -> int:
             max_food_drop=args.max_food_drop,
             max_death_increase=args.max_death_increase,
         )
-        for base, torch_name in PAIRS
+        for base, torch_name in pairs
     ]
 
-    overall_pass = all(c.get("pass", False) for c in checks)
+    if args.allow_missing_pairs:
+        overall_pass = all((not c.get("present", False)) or c.get("pass", False) for c in checks)
+    else:
+        overall_pass = all(c.get("pass", False) for c in checks)
     summary = {
         "overall_pass": overall_pass,
         "checks": checks,
         "input": str(in_path),
+        "allow_missing_pairs": bool(args.allow_missing_pairs),
+        "pairs": [f"{base}:{torch_name}" for base, torch_name in pairs],
     }
 
     print("Torch Migration Check")
@@ -112,7 +142,7 @@ def main() -> int:
     for c in checks:
         pair = f"{c['base']} -> {c['torch']}"
         if not c.get("present", False):
-            print(f"[FAIL] {pair}: missing data")
+            print(f"[{'SKIP' if args.allow_missing_pairs else 'FAIL'}] {pair}: missing data")
             continue
         metrics = c["metrics"]
         print(

@@ -41,6 +41,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Save full results to JSON file")
     p.add_argument("--quiet", "-q", action="store_true",
                    help="Suppress per-tick progress output")
+    p.add_argument(
+        "--torch-batch-policy",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Torch policy batching mode during headless runs (default: auto)",
+    )
     return p.parse_args(argv)
 
 
@@ -56,6 +62,7 @@ def run_comparison(
     ants: int | None,
     config_path: str,
     verbose: bool,
+    torch_batch_policy: str,
 ) -> dict[str, Any]:
     """Run all brains across all seeds. Returns full results dict."""
     all_results: dict[str, list[dict[str, Any]]] = {b: [] for b in brains}
@@ -76,6 +83,7 @@ def run_comparison(
                 ants=ants,
                 config_path=config_path,
                 verbose=verbose,
+                torch_batch_policy=torch_batch_policy,
             )
             all_results[brain].append(report)
 
@@ -190,6 +198,7 @@ def main(argv: list[str] | None = None) -> None:
         ants=args.ants,
         config_path=args.config,
         verbose=not args.quiet,
+        torch_batch_policy=args.torch_batch_policy,
     )
 
     print_comparison_table(results, brains)

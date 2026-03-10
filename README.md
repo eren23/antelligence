@@ -74,17 +74,18 @@ python3 compare_brains.py --brains nn torch_nn transformer torch_transformer
 Use Colab as a remote worker for torch benchmarks:
 
 1. Open [colab/torch_benchmark_worker.ipynb](colab/torch_benchmark_worker.ipynb) in Google Colab.
-2. Set parameters in the first code cell (`REPO_URL`, `BRANCH`, `TICKS`, `SEEDS`, `ANTS`).
+2. Set parameters in the first code cell (`REPO_URL`, `BRANCH`, `MODE`, `TICKS`, `WARMUP_TICKS`, `SEEDS`, `ANTS`).
 3. Run all cells. The notebook mounts Google Drive, syncs the repo branch, and runs:
 
 ```bash
-bash scripts/colab_benchmark.sh --ticks ... --seeds ... --ants ... --out-dir ...
+bash scripts/colab_benchmark.sh --mode torch_only --ticks ... --warmup-ticks ... --seeds ... --ants ... --out-dir ...
 ```
 
 Artifacts are written to Drive (timestamped run folder):
 - `migration.json` (full compare output)
-- `migration_check.json` (torch migration pass/fail summary)
+- `migration_check.json` (torch migration summary; NumPy baseline pairs are `SKIP` in `torch_only` mode)
 - `run_meta.json` (commit, device, thresholds, run parameters)
+- `perf_summary.json` (per-brain avg ticks/sec + wall time)
 
 ### CLI Arguments
 
