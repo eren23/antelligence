@@ -120,8 +120,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Record showcase demo video")
     p.add_argument("--load-weights", type=str, default=None,
                    help="Directory with trained weights")
-    p.add_argument("--brain", choices=["nn", "transformer", "mlx_nn", "mlx_transformer", "rule_based"],
-                   default="nn", help="Brain backend (default: nn)")
+    p.add_argument("--brain", choices=["torch_nn", "torch_transformer", "rule_based"],
+                   default="torch_nn", help="Brain backend (default: torch_nn)")
     p.add_argument("--output", "-o", type=str, default="showcase.mp4",
                    help="Output video path (default: showcase.mp4)")
     p.add_argument("--fps", type=int, default=30,
@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> None:
     control.show_trail_analysis = True
     control.show_hud = True
     control.show_density_heatmap = False  # too noisy layered with pheromones
-    if args.brain == "transformer":
+    if args.brain == "torch_transformer":
         control.show_attention = True
 
     # Renderer (needed for visual output)

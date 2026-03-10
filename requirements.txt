@@ -1,3 +1,4 @@
 pygame>=2.0
 numpy>=1.20
 pyyaml>=5.4
+# Optional: torch>=2.0  # PyTorch backend for NN/Transformer brains

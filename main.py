@@ -49,34 +49,27 @@ from agents.ant import (
 )
 from agents.colony import Colony, Corpse
 from agents.sensory import build_sensory
-from brains.nn_brain import (
-    NNBrain,
-    SharedWeightRegistry as NNWeightRegistry,
-    RoleTrainer as NNRoleTrainer,
-    compute_reward,
-)
+from world.spatial import SpatialGrid
+from brains.action_utils import compute_reward
+from brains.reward import SparseReward
 from brains.rule_based import RuleBasedBrain
-from brains.transformer_brain import (
-    TransformerBrain,
-    SharedWeightRegistry as TFWeightRegistry,
-    RoleTrainer as TFRoleTrainer,
-)
 
-# MLX backends (optional)
+# PyTorch backends (optional)
 try:
-    from brains.mlx_nn_brain import (
-        MLXNNBrain,
-        SharedWeightRegistry as MLXNNWeightRegistry,
-        RoleTrainer as MLXNNRoleTrainer,
+    from brains.torch_nn_brain import (
+        TorchNNBrain,
+        TorchSharedWeightRegistry as TorchNNWeightRegistry,
+        TorchRoleTrainer as TorchNNRoleTrainer,
     )
-    from brains.mlx_transformer_brain import (
-        MLXTransformerBrain,
-        SharedWeightRegistry as MLXTFWeightRegistry,
-        RoleTrainer as MLXTFRoleTrainer,
+    from brains.torch_transformer_brain import (
+        TorchTransformerBrain,
+        TorchTransformerSharedWeightRegistry as TorchTFWeightRegistry,
+        TorchTransformerRoleTrainer as TorchTFRoleTrainer,
     )
-    _MLX_AVAILABLE = True
+    from brains.action_dist import ActionDistribution, action_tensor_to_ant_actions
+    _TORCH_AVAILABLE = True
 except ImportError:
-    _MLX_AVAILABLE = False
+    _TORCH_AVAILABLE = False
 from config import SimConfig, default_config, load_config
 from metrics.emergence import EmergenceDetector
 from metrics.reporter import write_report
@@ -126,55 +119,6 @@ def _load_trainer_state(path: Path, trainer: object) -> None:
         trainer.global_step = state["global_step"]
 
 
-def _flatten_mlx_params(params: Any, prefix: str = "") -> dict[str, np.ndarray]:
-    """Flatten nested MLX parameter dict to {dotted_key: numpy_array}."""
-    import mlx.core as mx
-    flat: dict[str, np.ndarray] = {}
-    if isinstance(params, dict):
-        for k, v in params.items():
-            flat.update(_flatten_mlx_params(v, f"{prefix}{k}."))
-    elif isinstance(params, list):
-        for i, v in enumerate(params):
-            flat.update(_flatten_mlx_params(v, f"{prefix}{i}."))
-    else:
-        # params is an mx.array leaf
-        flat[prefix.rstrip(".")] = np.array(params)
-    return flat
-
-
-def _unflatten_mlx_params(model: Any, data: Any) -> None:
-    """Load flattened numpy arrays back into an MLX model."""
-    import mlx.core as mx
-
-    # Rebuild the nested dict structure from dotted keys
-    nested: dict = {}
-    for key in data.files:
-        parts = key.split(".")
-        d = nested
-        for p in parts[:-1]:
-            if p not in d:
-                d[p] = {}
-            d = d[p]
-        d[parts[-1]] = mx.array(data[key])
-
-    # Convert numeric string keys to list indices where needed
-    def _to_tree(d: dict) -> Any:
-        if not isinstance(d, dict):
-            return d
-        if all(k.isdigit() for k in d):
-            max_idx = max(int(k) for k in d)
-            lst = [None] * (max_idx + 1)
-            for k, v in d.items():
-                lst[int(k)] = _to_tree(v)
-            return lst
-        return {k: _to_tree(v) for k, v in d.items()}
-
-    tree = _to_tree(nested)
-    model.update(tree)
-    # Force MLX lazy evaluation to materialize loaded weights
-    mx.eval(model.parameters())  # noqa: S307 — mlx.core.eval, not builtins.eval
-
-
 # ---------------------------------------------------------------------------
 # Brain factory — creates and manages brain instances per backend type
 # ---------------------------------------------------------------------------
@@ -193,14 +137,10 @@ class BrainManager:
         self._current_type: str = cfg.brain.default
 
         # Shared registries (lazy)
-        self._nn_registry: NNWeightRegistry | None = None
-        self._nn_trainers: dict[str, NNRoleTrainer] = {}
-        self._tf_registry: TFWeightRegistry | None = None
-        self._tf_trainers: dict[str, TFRoleTrainer] = {}
-        self._mlx_nn_registry = None
-        self._mlx_nn_trainers: dict = {}
-        self._mlx_tf_registry = None
-        self._mlx_tf_trainers: dict = {}
+        self._torch_nn_registry = None
+        self._torch_nn_trainers: dict = {}
+        self._torch_tf_registry = None
+        self._torch_tf_trainers: dict = {}
 
     @property
     def current_type(self) -> str:
@@ -212,54 +152,27 @@ class BrainManager:
         """Save all initialized brain weights to a directory."""
         path.mkdir(parents=True, exist_ok=True)
 
-        # NN (NumPy MLP)
-        if self._nn_registry is not None:
-            for role in self._nn_registry.roles():
-                w = self._nn_registry.get(role)
-                np.savez(
-                    path / f"nn_{role}.npz",
-                    W1=w.W1, b1=w.b1, W2=w.W2, b2=w.b2,
-                    W_out=w.W_out, b_out=w.b_out,
-                    W_val=w.W_val, b_val=w.b_val,
-                )
-                trainer = self._nn_trainers.get(role)
+        # PyTorch NN
+        if self._torch_nn_registry is not None and _TORCH_AVAILABLE:
+            import torch as _torch
+            for role in self._torch_nn_registry.roles():
+                model = self._torch_nn_registry.get(role)
+                sd = {k: v.cpu().numpy() for k, v in model.state_dict().items()}
+                np.savez(path / f"torch_nn_{role}.npz", **sd)
+                trainer = self._torch_nn_trainers.get(role)
                 if trainer:
-                    _save_trainer_state(path / f"trainer_nn_{role}.json", trainer)
+                    _save_trainer_state(path / f"trainer_torch_nn_{role}.json", trainer)
 
-        # Transformer (NumPy)
-        if self._tf_registry is not None:
-            for role in self._tf_registry.roles():
-                ws = self._tf_registry.get(role)
-                params = ws.all_parameters()
-                np.savez(
-                    path / f"transformer_{role}.npz",
-                    **{f"p{i}": p for i, p in enumerate(params)},
-                )
-                trainer = self._tf_trainers.get(role)
+        # PyTorch Transformer
+        if self._torch_tf_registry is not None and _TORCH_AVAILABLE:
+            import torch as _torch
+            for role in self._torch_tf_registry.roles():
+                model = self._torch_tf_registry.get(role)
+                sd = {k: v.cpu().numpy() for k, v in model.state_dict().items()}
+                np.savez(path / f"torch_transformer_{role}.npz", **sd)
+                trainer = self._torch_tf_trainers.get(role)
                 if trainer:
-                    _save_trainer_state(path / f"trainer_transformer_{role}.json", trainer)
-
-        # MLX NN
-        if self._mlx_nn_registry is not None and _MLX_AVAILABLE:
-            import mlx.core as mx
-            for role in self._mlx_nn_registry.roles():
-                model = self._mlx_nn_registry.get(role)
-                flat = _flatten_mlx_params(model.parameters())
-                np.savez(path / f"mlx_nn_{role}.npz", **flat)
-                trainer = self._mlx_nn_trainers.get(role)
-                if trainer:
-                    _save_trainer_state(path / f"trainer_mlx_nn_{role}.json", trainer)
-
-        # MLX Transformer
-        if self._mlx_tf_registry is not None and _MLX_AVAILABLE:
-            import mlx.core as mx
-            for role in self._mlx_tf_registry.roles():
-                model = self._mlx_tf_registry.get(role)
-                flat = _flatten_mlx_params(model.parameters())
-                np.savez(path / f"mlx_transformer_{role}.npz", **flat)
-                trainer = self._mlx_tf_trainers.get(role)
-                if trainer:
-                    _save_trainer_state(path / f"trainer_mlx_transformer_{role}.json", trainer)
+                    _save_trainer_state(path / f"trainer_torch_transformer_{role}.json", trainer)
 
     def load_weights(self, path: Path) -> None:
         """Load weights from directory into registries."""
@@ -269,62 +182,36 @@ class BrainManager:
 
         loaded_any = False
 
-        # NN (NumPy MLP)
-        for npz in sorted(path.glob("nn_*.npz")):
-            role = npz.stem.removeprefix("nn_")
-            self._ensure_nn()
-            w = self._nn_registry.get(role)
-            d = np.load(npz)
-            w.W1[:] = d["W1"]; w.b1[:] = d["b1"]
-            w.W2[:] = d["W2"]; w.b2[:] = d["b2"]
-            w.W_out[:] = d["W_out"]; w.b_out[:] = d["b_out"]
-            if "W_val" in d:
-                w.W_val[:] = d["W_val"]; w.b_val[:] = d["b_val"]
-            trainer = self._nn_trainers.get(role)
-            if trainer:
-                _load_trainer_state(path / f"trainer_nn_{role}.json", trainer)
-            loaded_any = True
-
-        # Transformer (NumPy)
-        for npz in sorted(path.glob("transformer_*.npz")):
-            role = npz.stem.removeprefix("transformer_")
-            self._ensure_tf()
-            ws = self._tf_registry.get(role)
-            d = np.load(npz)
-            params = ws.all_parameters()
-            for i, p in enumerate(params):
-                key = f"p{i}"
-                if key in d:
-                    p[:] = d[key]
-            trainer = self._tf_trainers.get(role)
-            if trainer:
-                _load_trainer_state(path / f"trainer_transformer_{role}.json", trainer)
-            loaded_any = True
-
-        # MLX NN
-        if _MLX_AVAILABLE:
-            for npz in sorted(path.glob("mlx_nn_*.npz")):
-                role = npz.stem.removeprefix("mlx_nn_")
-                self._ensure_mlx_nn()
-                model = self._mlx_nn_registry.get(role)
+        # PyTorch NN
+        if _TORCH_AVAILABLE:
+            import torch as _torch
+            for npz in sorted(path.glob("torch_nn_*.npz")):
+                role = npz.stem.removeprefix("torch_nn_")
+                self._ensure_torch_nn()
+                model = self._torch_nn_registry.get(role)
                 d = np.load(npz)
-                _unflatten_mlx_params(model, d)
-                trainer = self._mlx_nn_trainers.get(role)
+                sd = {k: _torch.tensor(d[k]) for k in d.files}
+                model.load_state_dict(sd)
+                model.to(self._torch_nn_registry._device)
+                trainer = self._torch_nn_trainers.get(role)
                 if trainer:
-                    _load_trainer_state(path / f"trainer_mlx_nn_{role}.json", trainer)
+                    _load_trainer_state(path / f"trainer_torch_nn_{role}.json", trainer)
                 loaded_any = True
 
-        # MLX Transformer
-        if _MLX_AVAILABLE:
-            for npz in sorted(path.glob("mlx_transformer_*.npz")):
-                role = npz.stem.removeprefix("mlx_transformer_")
-                self._ensure_mlx_tf()
-                model = self._mlx_tf_registry.get(role)
+        # PyTorch Transformer
+        if _TORCH_AVAILABLE:
+            import torch as _torch
+            for npz in sorted(path.glob("torch_transformer_*.npz")):
+                role = npz.stem.removeprefix("torch_transformer_")
+                self._ensure_torch_tf()
+                model = self._torch_tf_registry.get(role)
                 d = np.load(npz)
-                _unflatten_mlx_params(model, d)
-                trainer = self._mlx_tf_trainers.get(role)
+                sd = {k: _torch.tensor(d[k]) for k in d.files}
+                model.load_state_dict(sd)
+                model.to(self._torch_tf_registry._device)
+                trainer = self._torch_tf_trainers.get(role)
                 if trainer:
-                    _load_trainer_state(path / f"trainer_mlx_transformer_{role}.json", trainer)
+                    _load_trainer_state(path / f"trainer_torch_transformer_{role}.json", trainer)
                 loaded_any = True
 
         if loaded_any:
@@ -334,68 +221,33 @@ class BrainManager:
 
     # -- lazy init helpers ---------------------------------------------------
 
-    def _ensure_nn(self) -> None:
-        if self._nn_registry is not None:
-            return
-        nn = self.cfg.brain.nn
-        self._nn_registry = NNWeightRegistry(
-            input_dim=39, hidden_sizes=nn.hidden_sizes, seed=self.seed,
-        )
-        for role in self._nn_registry.roles():
-            self._nn_trainers[role] = NNRoleTrainer(
-                self._nn_registry.get(role),
-                lr=nn.learning_rate,
-                gamma=nn.gamma,
-                buffer_size=nn.buffer_size,
-            )
-
-    def _ensure_tf(self) -> None:
-        if self._tf_registry is not None:
-            return
-        tf = self.cfg.brain.transformer
-        self._tf_registry = TFWeightRegistry(
-            input_dim=39,
-            d_model=tf.d_model,
-            n_heads=tf.n_heads,
-            n_layers=tf.n_layers,
-            ffn_dim=tf.ffn_dim,
-            seed=self.seed,
-        )
-        for role in self._tf_registry.roles():
-            self._tf_trainers[role] = TFRoleTrainer(
-                self._tf_registry.get(role),
-                lr=tf.learning_rate,
-                gamma=0.95,
-                buffer_size=tf.buffer_size,
-            )
-
-    def _ensure_mlx_nn(self) -> None:
-        if self._mlx_nn_registry is not None or not _MLX_AVAILABLE:
+    def _ensure_torch_nn(self) -> None:
+        if self._torch_nn_registry is not None or not _TORCH_AVAILABLE:
             return
         nn_cfg = self.cfg.brain.nn
-        self._mlx_nn_registry = MLXNNWeightRegistry(
+        self._torch_nn_registry = TorchNNWeightRegistry(
             input_dim=39, hidden_sizes=nn_cfg.hidden_sizes, seed=self.seed,
         )
-        for role in self._mlx_nn_registry.roles():
-            self._mlx_nn_trainers[role] = MLXNNRoleTrainer(
-                self._mlx_nn_registry.get(role),
+        for role in self._torch_nn_registry.roles():
+            self._torch_nn_trainers[role] = TorchNNRoleTrainer(
+                self._torch_nn_registry.get(role),
                 lr=nn_cfg.learning_rate, gamma=nn_cfg.gamma,
                 buffer_size=nn_cfg.buffer_size,
             )
 
-    def _ensure_mlx_tf(self) -> None:
-        if self._mlx_tf_registry is not None or not _MLX_AVAILABLE:
+    def _ensure_torch_tf(self) -> None:
+        if self._torch_tf_registry is not None or not _TORCH_AVAILABLE:
             return
         tf_cfg = self.cfg.brain.transformer
-        self._mlx_tf_registry = MLXTFWeightRegistry(
+        self._torch_tf_registry = TorchTFWeightRegistry(
             input_dim=39,
             d_model=tf_cfg.d_model, n_heads=tf_cfg.n_heads,
             n_layers=tf_cfg.n_layers, ffn_dim=tf_cfg.ffn_dim,
             seed=self.seed,
         )
-        for role in self._mlx_tf_registry.roles():
-            self._mlx_tf_trainers[role] = MLXTFRoleTrainer(
-                self._mlx_tf_registry.get(role),
+        for role in self._torch_tf_registry.roles():
+            self._torch_tf_trainers[role] = TorchTFRoleTrainer(
+                self._torch_tf_registry.get(role),
                 lr=tf_cfg.learning_rate, gamma=0.95,
                 buffer_size=tf_cfg.buffer_size,
                 context_length=tf_cfg.context_length,
@@ -415,39 +267,21 @@ class BrainManager:
                 world_height=self.cfg.world.height,
                 rng_seed=ant_seed,
             )
-        elif bt == "nn":
-            self._ensure_nn()
-            ant.brain = NNBrain(
+        elif bt == "torch_nn" and _TORCH_AVAILABLE:
+            self._ensure_torch_nn()
+            ant.brain = TorchNNBrain(
                 role=role,
-                registry=self._nn_registry,
-                trainer=self._nn_trainers[role],
+                registry=self._torch_nn_registry,
+                trainer=self._torch_nn_trainers[role],
                 cfg=self.cfg.brain.nn,
                 seed=ant_seed,
             )
-        elif bt == "transformer":
-            self._ensure_tf()
-            ant.brain = TransformerBrain(
+        elif bt == "torch_transformer" and _TORCH_AVAILABLE:
+            self._ensure_torch_tf()
+            ant.brain = TorchTransformerBrain(
                 role=role,
-                registry=self._tf_registry,
-                trainer=self._tf_trainers[role],
-                cfg=self.cfg.brain.transformer,
-                seed=ant_seed,
-            )
-        elif bt == "mlx_nn" and _MLX_AVAILABLE:
-            self._ensure_mlx_nn()
-            ant.brain = MLXNNBrain(
-                role=role,
-                registry=self._mlx_nn_registry,
-                trainer=self._mlx_nn_trainers[role],
-                cfg=self.cfg.brain.nn,
-                seed=ant_seed,
-            )
-        elif bt == "mlx_transformer" and _MLX_AVAILABLE:
-            self._ensure_mlx_tf()
-            ant.brain = MLXTransformerBrain(
-                role=role,
-                registry=self._mlx_tf_registry,
-                trainer=self._mlx_tf_trainers[role],
+                registry=self._torch_tf_registry,
+                trainer=self._torch_tf_trainers[role],
                 cfg=self.cfg.brain.transformer,
                 seed=ant_seed,
             )
@@ -677,17 +511,26 @@ def sim_tick(
     cfg: SimConfig,
     *,
     learn: bool = True,
+    torch_batch_policy: str = "auto",
+    perf_stats: dict[str, float] | None = None,
 ) -> None:
     """Execute one simulation tick (the full per-tick pipeline)."""
+    t_tick_start = _time.perf_counter() if perf_stats is not None else 0.0
     ants = colony.ants
+
+    # Build spatial grid for O(n) neighbor lookups
+    spatial_grid = SpatialGrid(cfg.world.width, cfg.world.height, cell_size=40)
+    spatial_grid.rebuild(ants)
 
     # 1. Build sensory inputs for all alive ants
     for ant in ants:
         if ant.alive:
-            ant.sensory = build_sensory(ant, world, pheromone_grid, ants, cfg.ant)
+            ant.sensory = build_sensory(ant, world, pheromone_grid, ants, cfg.ant,
+                                        spatial_grid=spatial_grid)
 
     # 2. Reward & learn from the *previous* tick's transition
     #    (must happen before decide() overwrites brain internals)
+    sparse_reward = SparseReward()
     if learn:
         for ant in ants:
             if not ant.alive or ant.brain is None or ant.sensory is None:
@@ -696,17 +539,111 @@ def sim_tick(
             if prev_act is None:
                 continue
             prev_si = getattr(ant.brain, "_prev_sensory", None)
-            reward = compute_reward(prev_si, ant.sensory, prev_act, True)
+            is_learning_brain = not isinstance(ant.brain, RuleBasedBrain)
+            if is_learning_brain:
+                reward = sparse_reward.compute(prev_si, ant.sensory, prev_act, True)
+            else:
+                reward = compute_reward(prev_si, ant.sensory, prev_act, True)
             ant.brain.learn(reward)
             metrics.accumulate_reward(reward)
 
     # 3. Brain decides
+    t_policy_start = _time.perf_counter() if perf_stats is not None else 0.0
     actions: dict[int, AntAction] = {}
+
+    # Phase 1 GPU path: batch torch policy inference by role
+    use_batched_torch = (
+        _TORCH_AVAILABLE
+        and torch_batch_policy in ("auto", "on")
+    )
+    if use_batched_torch:
+        try:
+            import torch as _torch
+
+            nn_groups: dict[str, list[Ant]] = {}
+            tf_groups: dict[str, list[Ant]] = {}
+            for ant in ants:
+                if not ant.alive or ant.brain is None or ant.sensory is None:
+                    continue
+                if isinstance(ant.brain, TorchNNBrain):
+                    nn_groups.setdefault(ant.role.value, []).append(ant)
+                elif isinstance(ant.brain, TorchTransformerBrain):
+                    tf_groups.setdefault(ant.role.value, []).append(ant)
+
+            # Batched torch NN forward pass per role
+            for role, group in nn_groups.items():
+                if not group:
+                    continue
+                model = group[0].brain.model
+                device = next(model.parameters()).device
+                vecs64 = [np.array(ant.sensory.to_vector(), dtype=np.float64) for ant in group]
+                batch = np.stack([v.astype(np.float32, copy=False) for v in vecs64], axis=0)
+                with _torch.no_grad():
+                    x = _torch.tensor(batch, dtype=_torch.float32, device=device)
+                    logits, _ = model(x)
+                    dist = ActionDistribution(logits)
+                    action_tensors = dist.sample()
+                    log_probs = dist.log_prob(action_tensors)
+                    action_np = action_tensors.cpu().numpy()
+                    lp_np = log_probs.cpu().numpy()
+                ant_actions = action_tensor_to_ant_actions(action_np)
+                for ant, vec64, action, lp in zip(group, vecs64, ant_actions, lp_np):
+                    ant.brain._prev_sensory = ant.sensory
+                    ant.brain._prev_action = action
+                    ant.brain._prev_log_prob = float(lp)
+                    ant.brain._prev_vec = vec64
+                    ant.brain._step_count += 1
+                    actions[ant.id] = action
+
+            # Batched torch transformer forward pass by role + seq_len
+            for role, group in tf_groups.items():
+                if not group:
+                    continue
+                model = group[0].brain.model
+                device = next(model.parameters()).device
+                seq_buckets: dict[int, list[tuple[Ant, np.ndarray, np.ndarray]]] = {}
+                for ant in group:
+                    vec64 = np.array(ant.sensory.to_vector(), dtype=np.float64)
+                    ant.brain.context.append(vec64)
+                    ctx = np.stack(list(ant.brain.context), axis=0)
+                    seq_buckets.setdefault(ctx.shape[0], []).append((ant, vec64, ctx))
+
+                for seq_len, items in seq_buckets.items():
+                    x_np = np.stack(
+                        [ctx.astype(np.float32, copy=False) for _, _, ctx in items],
+                        axis=0,
+                    )
+                    with _torch.no_grad():
+                        x = _torch.tensor(x_np, dtype=_torch.float32, device=device)
+                        logits, _ = model(x)
+                        dist = ActionDistribution(logits)
+                        action_tensors = dist.sample()
+                        log_probs = dist.log_prob(action_tensors)
+                        action_np = action_tensors.cpu().numpy()
+                        lp_np = log_probs.cpu().numpy()
+                    ant_actions = action_tensor_to_ant_actions(action_np)
+                    for (ant, _vec64, ctx), action, lp in zip(items, ant_actions, lp_np):
+                        ant.brain._prev_sensory = ant.sensory
+                        ant.brain._prev_action = action
+                        ant.brain._prev_log_prob = float(lp)
+                        ant.brain._prev_context_flat = ctx.flatten()
+                        ant.brain._prev_seq_len = ctx.shape[0]
+                        ant.brain._step_count += 1
+                        actions[ant.id] = action
+        except Exception:
+            # Safety fallback: keep simulation running if batching path fails.
+            if torch_batch_policy == "on":
+                raise
+
     for ant in ants:
+        if ant.id in actions:
+            continue
         if ant.alive and ant.brain is not None and ant.sensory is not None:
             actions[ant.id] = ant.brain.decide(ant.sensory)
         else:
             actions[ant.id] = AntAction()
+    if perf_stats is not None:
+        perf_stats["policy_s"] = perf_stats.get("policy_s", 0.0) + (_time.perf_counter() - t_policy_start)
 
     # 4. Apply actions — physics, movement, interactions
     for ant in ants:
@@ -715,7 +652,11 @@ def sim_tick(
         action = actions[ant.id]
 
         # Survival instinct: when energy is critically low, head toward nest
-        if cfg.brain.patches.survival_homing and ant.energy < cfg.ant.energy_max * 0.3:
+        # Gated: skip for learning brains unless learning_brain_patches is True
+        is_learning_brain = not isinstance(ant.brain, RuleBasedBrain)
+        if (cfg.brain.patches.survival_homing
+                and ant.energy < cfg.ant.energy_max * 0.3
+                and (cfg.brain.patches.learning_brain_patches or not is_learning_brain)):
             to_nest = world.nest.center - ant.pos
             nest_angle = math.atan2(to_nest.y, to_nest.x)
             turn_to_nest = nest_angle - ant.heading
@@ -743,8 +684,9 @@ def sim_tick(
             # Immediate death penalty so learning gets the signal
             # (the ant will be removed from colony.ants by colony.tick)
             if learn and ant.brain is not None:
-                ant.brain.learn(-0.5)
-                metrics.accumulate_reward(-0.5)
+                death_penalty = -1.0 if is_learning_brain else -0.5
+                ant.brain.learn(death_penalty)
+                metrics.accumulate_reward(death_penalty)
             continue
 
         # Nest: refill energy & auto-deposit food
@@ -754,8 +696,11 @@ def sim_tick(
             colony.deposit_food(carry_before)
 
         # Item interactions — auto-pickup if enabled, otherwise respect brain decision
+        # Gated: skip auto-pickup for learning brains unless learning_brain_patches is True
         was_carrying = ant.carrying
-        if action.pickup or (cfg.brain.patches.auto_pickup and ant.carrying is None):
+        if action.pickup or (cfg.brain.patches.auto_pickup
+                and (cfg.brain.patches.learning_brain_patches or not is_learning_brain)
+                and ant.carrying is None):
             try_pickup(ant, world, cfg.ant)
             # Nurses also try to pick up nearby corpses
             if ant.carrying is None and ant.role == Role.NURSE:
@@ -807,6 +752,8 @@ def sim_tick(
 
     # 11. Update emergence detectors
     emergence.update(tick, colony, world, pheromone_grid, snapshot.food_income)
+    if perf_stats is not None:
+        perf_stats["tick_s"] = perf_stats.get("tick_s", 0.0) + (_time.perf_counter() - t_tick_start)
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +768,7 @@ def run_headless(
     ants: int | None = None,
     config_path: str = "colony_config.yaml",
     verbose: bool = True,
+    torch_batch_policy: str = "auto",
 ) -> dict[str, Any]:
     """Run a headless simulation and return a JSON-serializable report dict.
 
@@ -853,16 +801,35 @@ def run_headless(
 
     # ---- Run simulation ----
     t_start = _time.perf_counter()
+    perf_stats: dict[str, float] = {"tick_s": 0.0, "policy_s": 0.0}
 
     for tick in range(1, ticks + 1):
-        sim_tick(tick, colony, world, pheromone_grid, brain_mgr, metrics, emergence, cfg)
+        sim_tick(
+            tick,
+            colony,
+            world,
+            pheromone_grid,
+            brain_mgr,
+            metrics,
+            emergence,
+            cfg,
+            torch_batch_policy=torch_batch_policy,
+            perf_stats=perf_stats,
+        )
 
         if verbose and tick % 1000 == 0:
             stats = colony.stats()
+            elapsed = _time.perf_counter() - t_start
+            avg_tick_ms = (perf_stats["tick_s"] / tick) * 1000.0 if tick > 0 else 0.0
+            avg_policy_ms = (perf_stats["policy_s"] / tick) * 1000.0 if tick > 0 else 0.0
+            tps = tick / elapsed if elapsed > 0 else 0.0
             print(
                 f"  [{brain}] Tick {tick:>8,}  |  Pop {stats.population:>4}"
                 f"  |  Food {stats.food_stored:>8.1f}"
                 f"  |  Deaths {stats.dead_count:>5}"
+                f"  |  {tps:>6.1f} t/s"
+                f"  |  sim {avg_tick_ms:>6.2f} ms"
+                f"  |  policy {avg_policy_ms:>6.2f} ms"
             )
 
     t_elapsed = _time.perf_counter() - t_start
@@ -934,7 +901,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Run without opening a window")
     p.add_argument("--ticks", "-t", type=int, default=0,
                    help="Max ticks (0 = unlimited)")
-    p.add_argument("--brain", choices=["rule_based", "nn", "transformer", "mlx_nn", "mlx_transformer"],
+    p.add_argument("--brain", choices=["rule_based", "torch_nn", "torch_transformer"],
                    default=None, help="Override initial brain backend")
     p.add_argument("--ants", type=int, default=None,
                    help="Override initial ant population count")
@@ -948,6 +915,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Load pre-trained weights from DIR on startup")
     p.add_argument("--autosave-interval", type=int, default=0,
                    help="Auto-save weights every N ticks (0 = disabled)")
+    p.add_argument(
+        "--torch-batch-policy",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Torch policy batching mode for action inference (default: auto)",
+    )
     return p.parse_args(argv)
 
 
@@ -970,6 +943,7 @@ def main(argv: list[str] | None = None) -> None:
             ants=args.ants,
             config_path=args.config,
             verbose=True,
+            torch_batch_policy=args.torch_batch_policy,
         )
         if args.report:
             rpath = Path(args.report)
@@ -1055,6 +1029,7 @@ def main(argv: list[str] | None = None) -> None:
                     sim_tick(
                         tick, colony, world, pheromone_grid,
                         brain_mgr, metrics, emergence, cfg,
+                        torch_batch_policy=args.torch_batch_policy,
                     )
                     tick_accumulator -= 1.0
 

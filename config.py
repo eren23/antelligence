@@ -98,27 +98,17 @@ class TransformerBrainConfig:
 
 
 @dataclass
-class ImitationConfig:
-    demo_ticks: int = 5000
-    demo_ants: int = 200
-    epochs: int = 50
-    batch_size: int = 64
-    learning_rate: float = 1e-3
-    lr_decay: float = 0.95
-
-
-@dataclass
 class PPOConfig:
-    rollout_length: int = 256
+    rollout_length: int = 1024
     epochs_per_update: int = 4
     batch_size: int = 64
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     value_loss_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.02
     max_grad_norm: float = 0.5
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
 
 
 @dataclass
@@ -127,6 +117,20 @@ class PatchConfig:
     auto_pickup: bool = True
     food_drop_guard: bool = True
     auto_deposit_at_nest: bool = True  # keep as physics rule
+    learning_brain_patches: bool = False  # if False, patches skip learning brains
+
+
+@dataclass
+class EvolutionConfig:
+    population_size: int = 20
+    eval_ticks: int = 5000
+    elitism: int = 4
+    tournament_size: int = 3
+    mutation_rate: float = 0.1
+    mutation_scale: float = 0.02
+    crossover_prob: float = 0.5
+    generations: int = 50
+    map_elites_dims: list[int] = field(default_factory=lambda: [10, 10])
 
 
 @dataclass
@@ -134,9 +138,9 @@ class BrainConfig:
     default: str = "rule_based"
     nn: NNBrainConfig = field(default_factory=NNBrainConfig)
     transformer: TransformerBrainConfig = field(default_factory=TransformerBrainConfig)
-    imitation: ImitationConfig = field(default_factory=ImitationConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
     patches: PatchConfig = field(default_factory=PatchConfig)
+    evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
 
 
 @dataclass
@@ -194,9 +198,9 @@ def _parse_brain(data: dict[str, Any] | None) -> BrainConfig:
         default=data.get("default", "rule_based"),
         nn=_map_dict(NNBrainConfig, data.get("nn")),
         transformer=_map_dict(TransformerBrainConfig, data.get("transformer")),
-        imitation=_map_dict(ImitationConfig, data.get("imitation")),
         ppo=_map_dict(PPOConfig, data.get("ppo")),
         patches=_map_dict(PatchConfig, data.get("patches")),
+        evolution=_map_dict(EvolutionConfig, data.get("evolution")),
     )
 
 
@@ -237,7 +241,7 @@ def _validate(cfg: SimConfig) -> None:
     if abs(total - 1.0) > 0.01:
         raise ConfigError(f"roles.default_distribution must sum to 1.0, got {total:.3f}")
 
-    valid_brains = ("rule_based", "nn", "transformer", "mlx_nn", "mlx_transformer")
+    valid_brains = ("rule_based", "torch_nn", "torch_transformer")
     if cfg.brain.default not in valid_brains:
         raise ConfigError(f"brain.default must be one of {valid_brains}, got {cfg.brain.default!r}")
 
