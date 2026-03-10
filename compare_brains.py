@@ -16,8 +16,8 @@ from typing import Any
 
 from main import run_headless
 
-DEFAULT_BRAINS = ["nn", "torch_nn", "transformer", "torch_transformer"]
-VALID_BRAINS = ["rule_based", "nn", "transformer", "torch_nn", "torch_transformer"]
+DEFAULT_BRAINS = ["torch_nn", "torch_transformer"]
+VALID_BRAINS = ["rule_based", "torch_nn", "torch_transformer"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

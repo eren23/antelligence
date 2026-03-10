@@ -1,51 +1,41 @@
 #!/usr/bin/env python3
-"""Fine-tune an imitation-trained brain with PPO.
+"""Fine-tune a brain with PPO using GPU-batched ActionDistribution.
+
+Two-phase collect-train loop:
+  Phase 1 (COLLECT): CPU sim + GPU inference per tick
+  Phase 2 (TRAIN):   All GPU — batched PPO updates via ActionDistribution
 
 Usage:
-    python train_ppo.py --brain nn --load-imitation weights/imitation/ --ticks 50000
-    python train_ppo.py --brain transformer --load-imitation weights/imitation/ --ticks 50000
+    python3 train_ppo.py --brain torch_nn --ticks 50000
+    python3 train_ppo.py --brain torch_transformer --ticks 50000 --lr 1e-4
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from agents.actions import AntAction
 from agents.sensory import SensoryInput, build_sensory
-from brains.nn_brain import (
-    MLPWeights,
-    NNBrain,
-    SharedWeightRegistry as NNWeightRegistry,
-    RoleTrainer as NNRoleTrainer,
-    compute_reward,
-    forward_with_value,
-    decode_output,
-    sample_action,
-    log_prob_of_action,
-)
+from brains.action_utils import compute_reward
 from brains.reward import SparseReward
-from brains.ppo import PPORoleTrainer, PPOStep, PPOTransformerRoleTrainer
-from brains.transformer_brain import (
-    TransformerBrain,
-    SharedWeightRegistry as TFWeightRegistry,
-    RoleTrainer as TFRoleTrainer,
-)
+from brains.torch_ppo import TorchPPOTrainer
+from brains.rollout_storage import RolloutStorage
 from config import SimConfig, load_config, default_config, PPOConfig
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="PPO fine-tuning after imitation learning")
-    p.add_argument("--brain", choices=["nn", "transformer", "torch_nn", "torch_transformer"], default="nn")
-    p.add_argument("--load-imitation", type=str, default="weights/imitation",
-                    help="Load imitation-trained weights from DIR")
+    p = argparse.ArgumentParser(description="PPO training with GPU-batched actions")
+    p.add_argument("--brain", choices=["torch_nn", "torch_transformer"], default="torch_nn")
+    p.add_argument("--load-weights", type=str, default=None,
+                    help="Load pre-trained weights from DIR")
     p.add_argument("--ticks", type=int, default=50000,
                     help="Total training ticks (default: 50000)")
     p.add_argument("--seed", type=int, default=42)
@@ -55,21 +45,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--validate-ticks", type=int, default=5000,
                     help="Ticks for validation run")
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--rollout-length", type=int, default=256)
+    p.add_argument("--rollout-length", type=int, default=1024)
     p.add_argument("--save-interval", type=int, default=10000,
                     help="Save weights every N ticks")
     p.add_argument("--ants", type=int, default=200)
     return p.parse_args()
-
-
-def compute_reward_ppo(
-    prev_sensory: SensoryInput | None,
-    curr_sensory: SensoryInput,
-    action: AntAction,
-    alive: bool,
-) -> float:
-    """PPO reward — delegates to SparseReward for genuine learning."""
-    return SparseReward().compute(prev_sensory, curr_sensory, action, alive)
 
 
 def main() -> None:
@@ -77,14 +57,15 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== PPO Fine-Tuning: {args.brain} ===")
+    print(f"=== PPO Training: {args.brain} ===")
     print(f"  ticks: {args.ticks}, lr: {args.lr}, seed: {args.seed}")
-    print(f"  loading imitation weights from: {args.load_imitation}")
+    if args.load_weights:
+        print(f"  loading weights from: {args.load_weights}")
     print()
 
-    # Setup
     random.seed(args.seed)
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     cfg_path = Path(args.config)
     cfg = load_config(cfg_path) if cfg_path.exists() else default_config()
@@ -98,63 +79,31 @@ def main() -> None:
     from metrics.tracker import MetricsTracker
     from metrics.emergence import EmergenceDetector
 
-    # Create brain manager and load imitation weights
     brain_mgr = BrainManager(cfg, args.seed)
-    imitation_path = Path(args.load_imitation)
-    if imitation_path.is_dir():
-        brain_mgr.load_weights(imitation_path)
-    else:
-        print(f"Warning: imitation weights not found at {imitation_path}")
+    if args.load_weights:
+        load_path = Path(args.load_weights)
+        if load_path.is_dir():
+            brain_mgr.load_weights(load_path)
 
-    # Create PPO trainers alongside the existing REINFORCE trainers
-    ppo_trainers: dict[str, Any] = {}
+    # Create PPO trainers per role
+    ppo_trainers: dict[str, TorchPPOTrainer] = {}
 
-    if args.brain == "nn":
-        brain_mgr._ensure_nn()
-        for role in brain_mgr._nn_registry.roles():
-            weights = brain_mgr._nn_registry.get(role)
-            ppo_trainers[role] = PPORoleTrainer(
-                weights,
-                lr=args.lr,
-                gamma=cfg.brain.ppo.gamma,
-                gae_lambda=cfg.brain.ppo.gae_lambda,
-                clip_epsilon=cfg.brain.ppo.clip_epsilon,
-                value_loss_coef=cfg.brain.ppo.value_loss_coef,
-                entropy_coef=cfg.brain.ppo.entropy_coef,
-                rollout_length=args.rollout_length,
-                epochs_per_update=cfg.brain.ppo.epochs_per_update,
-                batch_size=cfg.brain.ppo.batch_size,
-                max_grad_norm=cfg.brain.ppo.max_grad_norm,
-            )
-    elif args.brain == "transformer":
-        brain_mgr._ensure_tf()
-        for role in brain_mgr._tf_registry.roles():
-            ws = brain_mgr._tf_registry.get(role)
-            ppo_trainers[role] = PPOTransformerRoleTrainer(
-                ws,
-                lr=args.lr,
-                gamma=cfg.brain.ppo.gamma,
-                gae_lambda=cfg.brain.ppo.gae_lambda,
+    if args.brain == "torch_nn":
+        brain_mgr._ensure_torch_nn()
+        for role in brain_mgr._torch_nn_registry.roles():
+            model = brain_mgr._torch_nn_registry.get(role)
+            ppo_trainers[role] = TorchPPOTrainer.from_config(
+                model, cfg.brain.ppo, lr=args.lr,
                 rollout_length=args.rollout_length,
             )
-    elif args.brain.startswith("torch_"):
-        from brains.torch_ppo import TorchPPOTrainer
-        if args.brain == "torch_nn":
-            brain_mgr._ensure_torch_nn()
-            for role in brain_mgr._torch_nn_registry.roles():
-                model = brain_mgr._torch_nn_registry.get(role)
-                ppo_trainers[role] = TorchPPOTrainer.from_config(
-                    model, cfg.brain.ppo, lr=args.lr,
-                    rollout_length=args.rollout_length,
-                )
-        elif args.brain == "torch_transformer":
-            brain_mgr._ensure_torch_tf()
-            for role in brain_mgr._torch_tf_registry.roles():
-                model = brain_mgr._torch_tf_registry.get(role)
-                ppo_trainers[role] = TorchPPOTrainer.from_config(
-                    model, cfg.brain.ppo, lr=args.lr,
-                    rollout_length=args.rollout_length,
-                )
+    elif args.brain == "torch_transformer":
+        brain_mgr._ensure_torch_tf()
+        for role in brain_mgr._torch_tf_registry.roles():
+            model = brain_mgr._torch_tf_registry.get(role)
+            ppo_trainers[role] = TorchPPOTrainer.from_config(
+                model, cfg.brain.ppo, lr=args.lr,
+                rollout_length=args.rollout_length,
+            )
 
     # Initialize simulation
     world = World.from_config(cfg, seed=args.seed)
@@ -168,11 +117,7 @@ def main() -> None:
     emergence = EmergenceDetector(cfg.roles.default_distribution)
 
     def _ppo_state_from_brain(ant_brain: Any) -> np.ndarray | None:
-        """Extract PPO state in model-ready shape.
-
-        - torch_nn / nn: returns flat sensory vector (39,)
-        - torch_transformer: returns fixed-shape context (context_len, 39), zero-padded on the left
-        """
+        """Extract PPO state in model-ready shape."""
         prev_vec = getattr(ant_brain, "_prev_vec", None)
         if prev_vec is not None:
             return np.asarray(prev_vec, dtype=np.float32)
@@ -181,19 +126,16 @@ def main() -> None:
         if prev_ctx_flat is None:
             return None
 
-        # Transformer context path.
         if args.brain == "torch_transformer":
             flat = np.asarray(prev_ctx_flat, dtype=np.float32).reshape(-1)
             if flat.size % 39 != 0:
                 return None
-
             seq_len = int(getattr(ant_brain, "_prev_seq_len", 0))
             if seq_len <= 0:
                 seq_len = flat.size // 39
             seq_len = min(seq_len, flat.size // 39)
             if seq_len <= 0:
                 return None
-
             ctx = flat[: seq_len * 39].reshape(seq_len, 39)
             target_len = int(cfg.brain.transformer.context_length)
             if target_len > seq_len:
@@ -205,10 +147,12 @@ def main() -> None:
 
         return np.asarray(prev_ctx_flat, dtype=np.float32)
 
-    # Training loop with PPO
+    # Training loop
     t_start = time.perf_counter()
-    best_food = 0.0
-    food_window: list[float] = []  # rolling food tracking
+    sparse_reward = SparseReward()
+
+    from brains.action_dist import ActionDistribution
+    from brains.rollout_storage import RolloutStorage as RS
 
     for tick in range(1, args.ticks + 1):
         # Build sensory
@@ -226,10 +170,9 @@ def main() -> None:
                 continue
 
             prev_si = getattr(ant.brain, "_prev_sensory", None)
-            reward = compute_reward_ppo(prev_si, ant.sensory, prev_act, True)
+            reward = sparse_reward.compute(prev_si, ant.sensory, prev_act, True)
             metrics.accumulate_reward(reward)
 
-            # Add to PPO buffer for this role
             role = ant.role.value
             if role in ppo_trainers:
                 trainer = ppo_trainers[role]
@@ -238,58 +181,37 @@ def main() -> None:
                     prev_lp = getattr(ant.brain, "_prev_log_prob", 0.0)
 
                     # Get value estimate
-                    if args.brain == "nn":
-                        _, value, _ = forward_with_value(
-                            brain_mgr._nn_registry.get(role), prev_vec
-                        )
-                        value = float(value) if not isinstance(value, float) else value
-                    elif args.brain.startswith("torch_"):
-                        import torch as _torch
-                        with _torch.no_grad():
-                            _model = ppo_trainers[role].model
-                            _dev = next(_model.parameters()).device
-                            _x = _torch.tensor(prev_vec, dtype=_torch.float32, device=_dev)
-                            if args.brain == "torch_transformer":
-                                # Transformer expects (B, seq, input_dim=39). We store flattened context.
-                                if _x.dim() == 1:
-                                    if (_x.numel() % 39) != 0:
-                                        raise RuntimeError(
-                                            f"torch_transformer prev_vec has invalid size {_x.numel()} (not divisible by 39)",
-                                        )
-                                    _x = _x.view(1, -1, 39)
-                                elif _x.dim() == 2:
-                                    # Could be (seq, 39) or (B, flat_context)
-                                    if _x.shape[-1] == 39:
-                                        _x = _x.unsqueeze(0)
-                                    elif (_x.shape[-1] % 39) == 0:
-                                        _x = _x.view(_x.shape[0], -1, 39)
-                                    else:
-                                        raise RuntimeError(
-                                            f"torch_transformer prev_vec has invalid shape {tuple(_x.shape)}",
-                                        )
-                                else:
-                                    raise RuntimeError(
-                                        f"torch_transformer prev_vec has unsupported rank {_x.dim()}",
-                                    )
-                            else:
-                                if _x.dim() == 1:
-                                    _x = _x.unsqueeze(0)
-                            _, _val = _model(_x)
-                            value = float(_val.item())
-                    else:
-                        value = 0.0  # transformer doesn't have analytical value yet
+                    with torch.no_grad():
+                        _model = trainer.model
+                        _dev = trainer._device
+                        _x = torch.tensor(prev_vec, dtype=torch.float32, device=_dev)
+                        if args.brain == "torch_transformer":
+                            if _x.dim() == 1:
+                                _x = _x.view(1, -1, 39)
+                            elif _x.dim() == 2:
+                                _x = _x.unsqueeze(0)
+                        else:
+                            if _x.dim() == 1:
+                                _x = _x.unsqueeze(0)
+                        _, _val = _model(_x)
+                        value = float(_val.item())
 
-                    step = PPOStep(
-                        state=prev_vec,
-                        action=prev_act,
-                        log_prob=prev_lp,
-                        value=value,
-                        reward=reward,
-                        done=False,
-                    )
-                    trainer.buffer.add(step)
+                    # Store as tensors in RolloutStorage
+                    state_t = torch.tensor(prev_vec.flatten(), dtype=torch.float32, device=_dev)
+                    # Build action tensor from AntAction
+                    from brains.action_utils import _DEPOSIT_CHANNELS
+                    dep_idx = _DEPOSIT_CHANNELS.index(prev_act.deposit_pheromone)
+                    act_t = torch.tensor([
+                        prev_act.turn, prev_act.speed_mult, float(dep_idx),
+                        prev_act.deposit_strength,
+                        float(prev_act.pickup), float(prev_act.drop),
+                        float(prev_act.recruit_signal),
+                    ], dtype=torch.float32, device=_dev)
+                    lp_t = torch.tensor(prev_lp, dtype=torch.float32, device=_dev)
+                    val_t = torch.tensor(value, dtype=torch.float32, device=_dev)
 
-                    # Check if buffer is ready for update
+                    trainer.buffer.insert(state_t, act_t, lp_t, val_t, reward, False)
+
                     if trainer.buffer.ready:
                         update_metrics = trainer.update()
                         if update_metrics and tick % 5000 == 0:
@@ -303,7 +225,7 @@ def main() -> None:
             else:
                 actions[ant.id] = AntAction()
 
-        # Apply actions (same as sim_tick but with PPO reward function)
+        # Apply actions
         from agents.ant import (
             update_heading, advance_position, handle_obstacle_collision,
             handle_world_bounds, deplete_energy, check_death, refill_at_nest,
@@ -317,9 +239,6 @@ def main() -> None:
                 continue
             action = actions[ant.id]
 
-            # Survival homing removed — PPO training should never override the policy
-            # The policy must learn survival behavior on its own.
-
             update_heading(ant, action)
             advance_position(ant, action, world)
             handle_obstacle_collision(ant, world)
@@ -328,19 +247,17 @@ def main() -> None:
             deplete_energy(ant, action, cfg.ant)
             died = check_death(ant)
             if died:
-                # Death penalty to PPO buffer
                 role = ant.role.value
                 if role in ppo_trainers:
+                    trainer = ppo_trainers[role]
                     prev_vec = _ppo_state_from_brain(ant.brain)
                     if prev_vec is not None:
-                        ppo_trainers[role].buffer.add(PPOStep(
-                            state=prev_vec,
-                            action=action,
-                            log_prob=getattr(ant.brain, "_prev_log_prob", 0.0),
-                            value=0.0,
-                            reward=-0.5,
-                            done=True,
-                        ))
+                        _dev = trainer._device
+                        state_t = torch.tensor(prev_vec.flatten(), dtype=torch.float32, device=_dev)
+                        act_t = torch.zeros(7, dtype=torch.float32, device=_dev)
+                        lp_t = torch.tensor(0.0, dtype=torch.float32, device=_dev)
+                        val_t = torch.tensor(0.0, dtype=torch.float32, device=_dev)
+                        trainer.buffer.insert(state_t, act_t, lp_t, val_t, -0.5, True)
                 continue
 
             carry_before = ant.carry_amount

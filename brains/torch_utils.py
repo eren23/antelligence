@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from agents.actions import AntAction
-from brains.nn_brain import _DEPOSIT_CHANNELS
+from brains.action_utils import _DEPOSIT_CHANNELS
 
 
 # ---------------------------------------------------------------------------

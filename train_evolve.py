@@ -3,14 +3,12 @@
 
 Combines:
   - Population-based evolution with MAP-Elites diversity
-  - Learned judge model for fitness evaluation
   - Auto-curriculum for difficulty scaling
-  - Intrinsic motivation (RND curiosity)
   - Sparse reward signal (no hand-crafted shaping)
 
 Usage:
-    python train_evolve.py --brain nn --population 10 --generations 20
-    python train_evolve.py --brain transformer --population 20 --generations 50
+    python3 train_evolve.py --brain torch_nn --population 10 --generations 20
+    python3 train_evolve.py --brain torch_transformer --population 20 --generations 50
 """
 
 from __future__ import annotations
@@ -25,20 +23,7 @@ import numpy as np
 
 from agents.colony import Colony
 from agents.sensory import build_sensory
-from brains.intrinsic import IntrinsicCombiner, RNDExplorer
-from brains.judge import ComparisonBuffer, JudgeModel
-from brains.nn_brain import (
-    MLPWeights,
-    NNBrain,
-    SharedWeightRegistry as NNWeightRegistry,
-    RoleTrainer as NNRoleTrainer,
-)
 from brains.reward import SparseReward
-from brains.transformer_brain import (
-    TransformerBrain,
-    SharedWeightRegistry as TFWeightRegistry,
-    RoleTrainer as TFRoleTrainer,
-)
 from config import SimConfig, default_config, load_config
 from evolution.curriculum import AutoCurriculum
 from evolution.genome import ArchitectureGenome
@@ -52,7 +37,7 @@ from world.world import World
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evolutionary training for ant colony brains")
-    p.add_argument("--brain", choices=["nn", "transformer", "torch_nn", "torch_transformer"], default="nn")
+    p.add_argument("--brain", choices=["torch_nn", "torch_transformer"], default="torch_nn")
     p.add_argument("--population", type=int, default=10)
     p.add_argument("--generations", type=int, default=20)
     p.add_argument("--eval-ticks", type=int, default=5000)
@@ -66,22 +51,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--curriculum", action="store_true", default=False,
                     help="Enable auto-curriculum difficulty scaling")
     return p.parse_args()
-
-
-def _make_nn_weights(cfg: SimConfig, rng: np.random.Generator) -> list[np.ndarray]:
-    """Create a fresh set of NN weights as flat parameter list."""
-    nn_cfg = cfg.brain.nn
-    w = MLPWeights.random_init(39, nn_cfg.hidden_sizes[0], nn_cfg.hidden_sizes[1], 11, rng)
-    return w.all_params()
-
-
-def _make_tf_weights(cfg: SimConfig, rng: np.random.Generator) -> list[np.ndarray]:
-    """Create a fresh set of transformer weights as flat parameter list."""
-    from brains.transformer_brain import TransformerWeightSet
-    tf_cfg = cfg.brain.transformer
-    ws = TransformerWeightSet(39, tf_cfg.d_model, tf_cfg.n_heads, tf_cfg.n_layers,
-                              tf_cfg.ffn_dim, rng)
-    return [p.copy() for p in ws.all_parameters()]
 
 
 def _make_torch_nn_weights(cfg: SimConfig, rng: np.random.Generator) -> list[np.ndarray]:
@@ -112,17 +81,7 @@ def _load_weights_into_registry(
     seed: int,
 ):
     """Load weight arrays into a fresh registry (all roles get same weights)."""
-    if brain_type == "nn":
-        nn_cfg = cfg.brain.nn
-        registry = NNWeightRegistry(39, nn_cfg.hidden_sizes, seed)
-        for role in registry.roles():
-            w = registry.get(role)
-            params = w.all_params()
-            for p, src in zip(params, weights):
-                if p.shape == src.shape:
-                    p[:] = src
-        return registry
-    elif brain_type == "torch_nn":
+    if brain_type == "torch_nn":
         import torch
         from brains.torch_nn_brain import TorchSharedWeightRegistry
         nn_cfg = cfg.brain.nn
@@ -153,17 +112,7 @@ def _load_weights_into_registry(
             model.load_state_dict(sd)
         return registry
     else:
-        from brains.transformer_brain import TransformerWeightSet
-        tf_cfg = cfg.brain.transformer
-        registry = TFWeightRegistry(39, tf_cfg.d_model, tf_cfg.n_heads,
-                                     tf_cfg.n_layers, tf_cfg.ffn_dim, seed)
-        for role in registry.roles():
-            ws = registry.get(role)
-            params = ws.all_parameters()
-            for p, src in zip(params, weights):
-                if p.shape == src.shape:
-                    p[:] = src
-        return registry
+        raise ValueError(f"Unknown brain type: {brain_type}")
 
 
 def evaluate_individual(
@@ -189,32 +138,9 @@ def evaluate_individual(
     # Load weights into registry
     registry = _load_weights_into_registry(individual.weights, brain_type, cfg, rng_seed)
 
-    # Create RND explorer shared across ants
-    rnd = RNDExplorer(input_dim=39, seed=rng_seed)
-    combiner = IntrinsicCombiner(coef=individual.genome.intrinsic_coef)
-
     # Create brains for all ants
     sparse_reward = SparseReward()
-    if brain_type == "nn":
-        trainers: dict[str, NNRoleTrainer] = {}
-        for role in registry.roles():
-            trainers[role] = NNRoleTrainer(
-                registry.get(role),
-                lr=individual.genome.learning_rate,
-                gamma=cfg.brain.nn.gamma,
-                buffer_size=cfg.brain.nn.buffer_size,
-            )
-        for ant in colony.ants:
-            ant.brain = NNBrain(
-                role=ant.role.value,
-                registry=registry,
-                trainer=trainers[ant.role.value],
-                cfg=cfg.brain.nn,
-                seed=rng_seed + ant.id,
-                intrinsic_combiner=combiner,
-                rnd_explorer=rnd,
-            )
-    elif brain_type == "torch_nn":
+    if brain_type == "torch_nn":
         from brains.torch_nn_brain import TorchNNBrain, TorchRoleTrainer as TorchNNRT
         torch_trainers: dict[str, TorchNNRT] = {}
         for role in registry.roles():
@@ -254,24 +180,7 @@ def evaluate_individual(
                 seed=rng_seed + ant.id,
             )
     else:
-        tf_trainers: dict[str, TFRoleTrainer] = {}
-        for role in registry.roles():
-            tf_trainers[role] = TFRoleTrainer(
-                registry.get(role),
-                lr=individual.genome.learning_rate,
-                gamma=0.95,
-                buffer_size=cfg.brain.transformer.buffer_size,
-            )
-        for ant in colony.ants:
-            ant.brain = TransformerBrain(
-                role=ant.role.value,
-                registry=registry,
-                trainer=tf_trainers[ant.role.value],
-                cfg=cfg.brain.transformer,
-                seed=rng_seed + ant.id,
-                intrinsic_combiner=combiner,
-                rnd_explorer=rnd,
-            )
+        raise ValueError(f"Unknown brain type: {brain_type}")
 
     # Metrics
     metrics = MetricsTracker(window=0)
@@ -369,17 +278,7 @@ def evaluate_individual(
         # Assign brains to newly spawned ants
         for ant in colony.ants:
             if ant.brain is None and ant.alive:
-                if brain_type == "nn":
-                    ant.brain = NNBrain(
-                        role=ant.role.value,
-                        registry=registry,
-                        trainer=trainers[ant.role.value],
-                        cfg=cfg.brain.nn,
-                        seed=rng_seed + ant.id,
-                        intrinsic_combiner=combiner,
-                        rnd_explorer=rnd,
-                    )
-                elif brain_type == "torch_nn":
+                if brain_type == "torch_nn":
                     from brains.torch_nn_brain import TorchNNBrain
                     ant.brain = TorchNNBrain(
                         role=ant.role.value,
@@ -396,16 +295,6 @@ def evaluate_individual(
                         trainer=torch_tf_trainers[ant.role.value],
                         cfg=cfg.brain.transformer,
                         seed=rng_seed + ant.id,
-                    )
-                else:
-                    ant.brain = TransformerBrain(
-                        role=ant.role.value,
-                        registry=registry,
-                        trainer=tf_trainers[ant.role.value],
-                        cfg=cfg.brain.transformer,
-                        seed=rng_seed + ant.id,
-                        intrinsic_combiner=combiner,
-                        rnd_explorer=rnd,
                     )
 
         snapshot = metrics.record(tick, colony, world, pheromone_grid)
@@ -455,23 +344,17 @@ def main() -> None:
     )
 
     def weight_factory():
-        if args.brain == "nn":
-            return _make_nn_weights(cfg, rng)
-        elif args.brain == "torch_nn":
+        if args.brain == "torch_nn":
             return _make_torch_nn_weights(cfg, rng)
         elif args.brain == "torch_transformer":
             return _make_torch_tf_weights(cfg, rng)
         else:
-            return _make_tf_weights(cfg, rng)
+            raise ValueError(f"Unknown brain type: {args.brain}")
 
     pop_mgr.initialize(weight_factory)
 
     # MAP-Elites archive
     archive = MAPElitesArchive(dims=tuple(args.map_elites_dims))
-
-    # Judge model
-    judge = JudgeModel(input_dim=12, hidden=32, seed=args.seed)
-    comparison_buffer = ComparisonBuffer(capacity=200)
 
     # Auto-curriculum
     curriculum = AutoCurriculum() if args.curriculum else None
@@ -492,25 +375,13 @@ def main() -> None:
                 args.seed + gen * 1000, args.ants,
             )
 
-            # Compute fitness: judge score + raw food as baseline
-            judge_features = np.concatenate([emergence_vec, tracker_vec])
-            judge_score = judge.score(judge_features)
-            fitness = food_total + judge_score * 10.0  # blend
+            # Fitness is raw food collected
+            fitness = food_total
 
             pop_mgr.set_fitness(idx, fitness, behavior)
 
-            # Record for judge training
-            comparison_buffer.add_episode(judge_features, food_total)
-
             # Try to insert into MAP-Elites
             archive.try_insert(individual)
-
-        # Train judge from comparisons
-        if len(comparison_buffer) >= 4:
-            pairs = comparison_buffer.sample_pairs(n=32, rng=rng)
-            judge_loss = judge.train_from_comparisons(pairs)
-        else:
-            judge_loss = 0.0
 
         # Update curriculum
         best = pop_mgr.get_best()
@@ -529,7 +400,6 @@ def main() -> None:
             f"  Mean {stats['mean_fitness']:>8.1f}  |"
             f"  Std {stats['std_fitness']:>6.2f}  |"
             f"  Archive {archive.coverage()*100:.0f}%  |"
-            f"  Judge loss {judge_loss:.4f}  |"
             f"  {gen_time:.1f}s"
         )
 

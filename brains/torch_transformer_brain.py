@@ -19,7 +19,7 @@ import torch.nn as nn
 
 from agents.actions import AntAction
 from agents.sensory import SensoryInput
-from brains.nn_brain import (
+from brains.action_utils import (
     _DEPOSIT_CHANNELS,
     compute_reward,
     decode_output,

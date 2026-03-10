@@ -1,26 +1,22 @@
-"""PyTorch PPO trainer — works with both TorchMLPModel and TorchTransformerModel.
+"""PyTorch PPO trainer — GPU-batched via ActionDistribution.
 
-Reuses PPORolloutBuffer and PPOStep from brains/ppo.py for trajectory storage.
-Converts numpy arrays to tensors at training time.
+Works with any nn.Module that returns (logits, value).
+Uses RolloutStorage for pre-allocated GPU tensor buffers and
+ActionDistribution for fully batched log_prob/entropy computation.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Any
-
-import numpy as np
 import torch
 import torch.nn as nn
 
-from agents.actions import AntAction
-from brains.ppo import PPORolloutBuffer, PPOStep
-from brains.torch_utils import get_device, torch_entropy, torch_log_prob_of_action
+from brains.action_dist import ActionDistribution
+from brains.rollout_storage import RolloutStorage
 from config import PPOConfig
 
 
 class TorchPPOTrainer:
-    """PPO with autograd. Works with any nn.Module that returns (logits, value)."""
+    """PPO with autograd and batched GPU action distributions."""
 
     def __init__(
         self,
@@ -35,6 +31,7 @@ class TorchPPOTrainer:
         batch_size: int = 64,
         max_grad_norm: float = 0.5,
         rollout_length: int = 1024,
+        input_dim: int = 39,
     ):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -47,10 +44,10 @@ class TorchPPOTrainer:
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
         self.rollout_length = rollout_length
-        self.buffer = PPORolloutBuffer(rollout_length)
+        self._device = next(model.parameters()).device
+        self.buffer = RolloutStorage(rollout_length, input_dim, self._device)
         self.global_step: int = 0
         self.baseline: float = 0.0  # compatibility with trainer state save/load
-        self._device = next(model.parameters()).device
 
     @classmethod
     def from_config(
@@ -59,6 +56,7 @@ class TorchPPOTrainer:
         cfg: PPOConfig,
         lr: float | None = None,
         rollout_length: int | None = None,
+        input_dim: int = 39,
     ) -> TorchPPOTrainer:
         return cls(
             model=model,
@@ -72,6 +70,7 @@ class TorchPPOTrainer:
             batch_size=cfg.batch_size,
             max_grad_norm=cfg.max_grad_norm,
             rollout_length=rollout_length or cfg.rollout_length,
+            input_dim=input_dim,
         )
 
     def update(self) -> dict[str, float]:
@@ -80,32 +79,30 @@ class TorchPPOTrainer:
             return {}
 
         self.global_step += 1
+        n = len(self.buffer)
 
         # Bootstrap value from last state
-        last_step = self.buffer._steps[-1]
         with torch.no_grad():
-            last_state_t = torch.tensor(
-                last_step.state, dtype=torch.float32, device=self._device,
-            ).unsqueeze(0)
-            _, last_val = self.model(last_state_t)
-            last_value = 0.0 if last_step.done else float(last_val.item())
+            last_state = self.buffer.states[n - 1].unsqueeze(0)
+            _, last_val = self.model(last_state)
+            last_done = self.buffer.dones[n - 1].item()
+            last_value = 0.0 if last_done > 0.5 else float(last_val.item())
 
-        # Compute GAE (numpy)
-        states, advantages, returns, actions, old_log_probs, old_values = \
-            self.buffer.compute_gae(last_value, self.gamma, self.gae_lambda)
+        # Compute GAE
+        advantages, returns = self.buffer.compute_gae(
+            last_value, self.gamma, self.gae_lambda,
+        )
 
-        # Convert to tensors
-        states_t = torch.tensor(states, dtype=torch.float32, device=self._device)
-        advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self._device)
-        returns_t = torch.tensor(returns, dtype=torch.float32, device=self._device)
-        old_lp_t = torch.tensor(old_log_probs, dtype=torch.float32, device=self._device)
+        # Slice active buffer data
+        states_t = self.buffer.states[:n]
+        actions_t = self.buffer.actions[:n]
+        old_lp_t = self.buffer.log_probs[:n]
 
         # Normalize advantages
-        adv_std = advantages_t.std()
+        adv_std = advantages.std()
         if adv_std > 1e-8:
-            advantages_t = (advantages_t - advantages_t.mean()) / adv_std
+            advantages = (advantages - advantages.mean()) / adv_std
 
-        n = len(states)
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
@@ -119,19 +116,18 @@ class TorchPPOTrainer:
                 idx = perm[start:end]
 
                 batch_states = states_t[idx]
-                batch_adv = advantages_t[idx]
-                batch_returns = returns_t[idx]
+                batch_adv = advantages[idx]
+                batch_returns = returns[idx]
                 batch_old_lp = old_lp_t[idx]
-                batch_actions = [actions[i] for i in idx.cpu().tolist()]
+                batch_actions = actions_t[idx]
 
                 # Forward
                 logits, values = self.model(batch_states)
 
-                # Compute new log probs
-                new_log_probs = torch.stack([
-                    torch_log_prob_of_action(logits[i], batch_actions[i])
-                    for i in range(len(batch_actions))
-                ])
+                # Batched log_prob + entropy via ActionDistribution
+                dist = ActionDistribution(logits)
+                new_log_probs = dist.log_prob(batch_actions)
+                entropy = dist.entropy().mean()
 
                 # Ratio
                 ratio = (new_log_probs - batch_old_lp).exp()
@@ -141,11 +137,8 @@ class TorchPPOTrainer:
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss (clipped)
+                # Value loss
                 value_loss = 0.5 * (values - batch_returns).pow(2).mean()
-
-                # Entropy bonus
-                entropy = torch_entropy(logits).mean()
 
                 # Total loss
                 loss = (

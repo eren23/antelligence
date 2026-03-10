@@ -50,22 +50,9 @@ from agents.ant import (
 from agents.colony import Colony, Corpse
 from agents.sensory import build_sensory
 from world.spatial import SpatialGrid
-from brains.nn_brain import (
-    NNBrain,
-    SharedWeightRegistry as NNWeightRegistry,
-    RoleTrainer as NNRoleTrainer,
-    compute_reward,
-    decode_output,
-    sample_action,
-    log_prob_of_action,
-)
+from brains.action_utils import compute_reward
 from brains.reward import SparseReward
 from brains.rule_based import RuleBasedBrain
-from brains.transformer_brain import (
-    TransformerBrain,
-    SharedWeightRegistry as TFWeightRegistry,
-    RoleTrainer as TFRoleTrainer,
-)
 
 # PyTorch backends (optional)
 try:
@@ -79,6 +66,7 @@ try:
         TorchTransformerSharedWeightRegistry as TorchTFWeightRegistry,
         TorchTransformerRoleTrainer as TorchTFRoleTrainer,
     )
+    from brains.action_dist import ActionDistribution, action_tensor_to_ant_actions
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
@@ -149,10 +137,6 @@ class BrainManager:
         self._current_type: str = cfg.brain.default
 
         # Shared registries (lazy)
-        self._nn_registry: NNWeightRegistry | None = None
-        self._nn_trainers: dict[str, NNRoleTrainer] = {}
-        self._tf_registry: TFWeightRegistry | None = None
-        self._tf_trainers: dict[str, TFRoleTrainer] = {}
         self._torch_nn_registry = None
         self._torch_nn_trainers: dict = {}
         self._torch_tf_registry = None
@@ -167,33 +151,6 @@ class BrainManager:
     def save_weights(self, path: Path) -> None:
         """Save all initialized brain weights to a directory."""
         path.mkdir(parents=True, exist_ok=True)
-
-        # NN (NumPy MLP)
-        if self._nn_registry is not None:
-            for role in self._nn_registry.roles():
-                w = self._nn_registry.get(role)
-                np.savez(
-                    path / f"nn_{role}.npz",
-                    W1=w.W1, b1=w.b1, W2=w.W2, b2=w.b2,
-                    W_out=w.W_out, b_out=w.b_out,
-                    W_val=w.W_val, b_val=w.b_val,
-                )
-                trainer = self._nn_trainers.get(role)
-                if trainer:
-                    _save_trainer_state(path / f"trainer_nn_{role}.json", trainer)
-
-        # Transformer (NumPy)
-        if self._tf_registry is not None:
-            for role in self._tf_registry.roles():
-                ws = self._tf_registry.get(role)
-                params = ws.all_parameters()
-                np.savez(
-                    path / f"transformer_{role}.npz",
-                    **{f"p{i}": p for i, p in enumerate(params)},
-                )
-                trainer = self._tf_trainers.get(role)
-                if trainer:
-                    _save_trainer_state(path / f"trainer_transformer_{role}.json", trainer)
 
         # PyTorch NN
         if self._torch_nn_registry is not None and _TORCH_AVAILABLE:
@@ -224,38 +181,6 @@ class BrainManager:
             return
 
         loaded_any = False
-
-        # NN (NumPy MLP)
-        for npz in sorted(path.glob("nn_*.npz")):
-            role = npz.stem.removeprefix("nn_")
-            self._ensure_nn()
-            w = self._nn_registry.get(role)
-            d = np.load(npz)
-            w.W1[:] = d["W1"]; w.b1[:] = d["b1"]
-            w.W2[:] = d["W2"]; w.b2[:] = d["b2"]
-            w.W_out[:] = d["W_out"]; w.b_out[:] = d["b_out"]
-            if "W_val" in d:
-                w.W_val[:] = d["W_val"]; w.b_val[:] = d["b_val"]
-            trainer = self._nn_trainers.get(role)
-            if trainer:
-                _load_trainer_state(path / f"trainer_nn_{role}.json", trainer)
-            loaded_any = True
-
-        # Transformer (NumPy)
-        for npz in sorted(path.glob("transformer_*.npz")):
-            role = npz.stem.removeprefix("transformer_")
-            self._ensure_tf()
-            ws = self._tf_registry.get(role)
-            d = np.load(npz)
-            params = ws.all_parameters()
-            for i, p in enumerate(params):
-                key = f"p{i}"
-                if key in d:
-                    p[:] = d[key]
-            trainer = self._tf_trainers.get(role)
-            if trainer:
-                _load_trainer_state(path / f"trainer_transformer_{role}.json", trainer)
-            loaded_any = True
 
         # PyTorch NN
         if _TORCH_AVAILABLE:
@@ -295,41 +220,6 @@ class BrainManager:
             print(f"No weight files found in '{path}'.")
 
     # -- lazy init helpers ---------------------------------------------------
-
-    def _ensure_nn(self) -> None:
-        if self._nn_registry is not None:
-            return
-        nn = self.cfg.brain.nn
-        self._nn_registry = NNWeightRegistry(
-            input_dim=39, hidden_sizes=nn.hidden_sizes, seed=self.seed,
-        )
-        for role in self._nn_registry.roles():
-            self._nn_trainers[role] = NNRoleTrainer(
-                self._nn_registry.get(role),
-                lr=nn.learning_rate,
-                gamma=nn.gamma,
-                buffer_size=nn.buffer_size,
-            )
-
-    def _ensure_tf(self) -> None:
-        if self._tf_registry is not None:
-            return
-        tf = self.cfg.brain.transformer
-        self._tf_registry = TFWeightRegistry(
-            input_dim=39,
-            d_model=tf.d_model,
-            n_heads=tf.n_heads,
-            n_layers=tf.n_layers,
-            ffn_dim=tf.ffn_dim,
-            seed=self.seed,
-        )
-        for role in self._tf_registry.roles():
-            self._tf_trainers[role] = TFRoleTrainer(
-                self._tf_registry.get(role),
-                lr=tf.learning_rate,
-                gamma=0.95,
-                buffer_size=tf.buffer_size,
-            )
 
     def _ensure_torch_nn(self) -> None:
         if self._torch_nn_registry is not None or not _TORCH_AVAILABLE:
@@ -376,24 +266,6 @@ class BrainManager:
                 world_width=self.cfg.world.width,
                 world_height=self.cfg.world.height,
                 rng_seed=ant_seed,
-            )
-        elif bt == "nn":
-            self._ensure_nn()
-            ant.brain = NNBrain(
-                role=role,
-                registry=self._nn_registry,
-                trainer=self._nn_trainers[role],
-                cfg=self.cfg.brain.nn,
-                seed=ant_seed,
-            )
-        elif bt == "transformer":
-            self._ensure_tf()
-            ant.brain = TransformerBrain(
-                role=role,
-                registry=self._tf_registry,
-                trainer=self._tf_trainers[role],
-                cfg=self.cfg.brain.transformer,
-                seed=ant_seed,
             )
         elif bt == "torch_nn" and _TORCH_AVAILABLE:
             self._ensure_torch_nn()
@@ -709,14 +581,16 @@ def sim_tick(
                 with _torch.no_grad():
                     x = _torch.tensor(batch, dtype=_torch.float32, device=device)
                     logits, _ = model(x)
-                    raw = logits.detach().cpu().numpy()
-                for ant, vec64, raw_np in zip(group, vecs64, raw):
-                    decoded = decode_output(raw_np)
-                    action = sample_action(decoded, ant.brain.rng)
-                    lp = log_prob_of_action(decoded, action)
+                    dist = ActionDistribution(logits)
+                    action_tensors = dist.sample()
+                    log_probs = dist.log_prob(action_tensors)
+                    action_np = action_tensors.cpu().numpy()
+                    lp_np = log_probs.cpu().numpy()
+                ant_actions = action_tensor_to_ant_actions(action_np)
+                for ant, vec64, action, lp in zip(group, vecs64, ant_actions, lp_np):
                     ant.brain._prev_sensory = ant.sensory
                     ant.brain._prev_action = action
-                    ant.brain._prev_log_prob = lp
+                    ant.brain._prev_log_prob = float(lp)
                     ant.brain._prev_vec = vec64
                     ant.brain._step_count += 1
                     actions[ant.id] = action
@@ -742,15 +616,16 @@ def sim_tick(
                     with _torch.no_grad():
                         x = _torch.tensor(x_np, dtype=_torch.float32, device=device)
                         logits, _ = model(x)
-                        raw = logits.detach().cpu().numpy()
-
-                    for (ant, _vec64, ctx), raw_np in zip(items, raw):
-                        decoded = decode_output(raw_np)
-                        action = sample_action(decoded, ant.brain.rng)
-                        lp = log_prob_of_action(decoded, action)
+                        dist = ActionDistribution(logits)
+                        action_tensors = dist.sample()
+                        log_probs = dist.log_prob(action_tensors)
+                        action_np = action_tensors.cpu().numpy()
+                        lp_np = log_probs.cpu().numpy()
+                    ant_actions = action_tensor_to_ant_actions(action_np)
+                    for (ant, _vec64, ctx), action, lp in zip(items, ant_actions, lp_np):
                         ant.brain._prev_sensory = ant.sensory
                         ant.brain._prev_action = action
-                        ant.brain._prev_log_prob = lp
+                        ant.brain._prev_log_prob = float(lp)
                         ant.brain._prev_context_flat = ctx.flatten()
                         ant.brain._prev_seq_len = ctx.shape[0]
                         ant.brain._step_count += 1
@@ -1026,7 +901,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Run without opening a window")
     p.add_argument("--ticks", "-t", type=int, default=0,
                    help="Max ticks (0 = unlimited)")
-    p.add_argument("--brain", choices=["rule_based", "nn", "transformer", "torch_nn", "torch_transformer"],
+    p.add_argument("--brain", choices=["rule_based", "torch_nn", "torch_transformer"],
                    default=None, help="Override initial brain backend")
     p.add_argument("--ants", type=int, default=None,
                    help="Override initial ant population count")
